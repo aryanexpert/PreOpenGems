@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 # ============================================================
 # 💎 PREOPEN GEMS OFFICIAL
-# NSE PRE-OPEN BOSS + FUNDAMENTAL QUALITY BOT
+# NSE PRE-OPEN BOSS + FUNDAMENTAL QUALITY SCORE
 # ============================================================
 
 NSE_URL = "https://www.nseindia.com/api/market-data-pre-open"
@@ -17,7 +17,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SCAN_INTERVAL = 30
 
 # ============================================================
-# 🔒 BOSS FILTER — LOCKED / NEVER CHANGE
+# 🔒 BOSS FILTER — LOCKED
+# DO NOT CHANGE
 # ============================================================
 
 MIN_CHANGE = 2.0
@@ -25,23 +26,24 @@ MIN_RATIO = 3.0
 MIN_BUY_QTY = 50_000
 
 # ============================================================
-# 💎 FUNDAMENTAL QUALITY FILTER
+# 💎 FUNDAMENTAL QUALITY SCORE
 # ============================================================
 
-MIN_MARKET_CAP = 2_000_00_00_000      # ₹2,000 Cr
-MIN_ROE = 12.0
-MIN_ROCE = 15.0
-MAX_DEBT_EQUITY = 0.50
-MIN_SALES_GROWTH = 10.0
-MIN_PROFIT_GROWTH = 10.0
-MAX_PLEDGE = 5.0
+MIN_MARKET_CAP = 500_00_00_000      # ₹500 Cr
+MIN_GEM_SCORE = 4
+MIN_STRONG_SCORE = 5
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-TELEGRAM_SEND_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-TELEGRAM_GET_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+TELEGRAM_SEND_URL = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+)
+
+TELEGRAM_GET_URL = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+)
 
 # ============================================================
 # NSE HEADERS
@@ -63,10 +65,14 @@ IST = ZoneInfo("Asia/Kolkata")
 nse_session = requests.Session()
 nse_session.headers.update(HEADERS)
 
-alerted_stocks = set()
+# ============================================================
+# MEMORY
+# ============================================================
 
-# Fundamental data cache
+alerted_stocks = set()
 fundamental_cache = {}
+
+telegram_offset = 0
 
 
 # ============================================================
@@ -82,7 +88,9 @@ def now_ist():
 # ============================================================
 
 def send_telegram(message, chat_id=None):
+
     try:
+
         target_chat = chat_id if chat_id else CHAT_ID
 
         response = requests.post(
@@ -95,31 +103,41 @@ def send_telegram(message, chat_id=None):
         )
 
         if response.status_code == 200:
+
             print("Telegram message sent.")
             return True
 
-        print("Telegram ERROR:", response.status_code)
+        print(
+            "Telegram ERROR:",
+            response.status_code
+        )
+
         print(response.text)
 
     except Exception as e:
-        print("Telegram connection error:", e)
+
+        print(
+            "Telegram connection error:",
+            e
+        )
 
     return False
 
 
 # ============================================================
-# START MESSAGE
+# /START
 # ============================================================
 
 def start_message():
+
     return (
         "👋 Hello!\n\n"
+
         "💎 Welcome to PreOpen Gems Official\n"
         "NSE Pre-Open Market Intelligence Bot\n\n"
 
-        "📊 What this bot does:\n"
-        "Scans NSE pre-open data and identifies stocks "
-        "with strong buying interest plus fundamental quality.\n\n"
+        "📊 This bot scans NSE pre-open data "
+        "for strong buying interest.\n\n"
 
         "⏰ Active Time\n"
         "09:00 AM – 09:08 AM IST\n\n"
@@ -133,37 +151,34 @@ def start_message():
         "• Buy Quantity ≥ 50,000\n"
         "• Series = EQ\n\n"
 
-        "💎 FUNDAMENTAL QUALITY\n"
-        "• Market Cap ≥ ₹2,000 Cr\n"
-        "• ROE ≥ 12%\n"
-        "• ROCE ≥ 15%\n"
-        "• Debt/Equity ≤ 0.50\n"
-        "• Sales Growth ≥ 10%\n"
-        "• Profit Growth ≥ 10%\n"
-        "• Promoter Pledge ≤ 5%\n\n"
+        "💎 FUNDAMENTAL QUALITY SCORE\n"
+        "7 parameters\n"
+        "Minimum GEM Score = 4/7\n\n"
 
-        "⚠️ Informational/educational use only.\n\n"
+        "⚠️ Pre-open data is indicative.\n"
+        "For information and educational purposes only.\n\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
         "💎 PREOPEN GEMS OFFICIAL\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
+
         "💻 Made by Prakash Kanki"
     )
 
 
 # ============================================================
-# TEST MESSAGE
+# /TEST
 # ============================================================
 
 def test_message():
+
     return (
         "🧪 PREOPEN GEMS OFFICIAL — TEST\n\n"
 
-        "👋 Hello Prakash!\n\n"
-
-        "✅ Telegram connection is working!\n"
-        "✅ Bot is online!\n"
-        "✅ BOSS filter loaded!\n"
-        "✅ Fundamental filter loaded!\n\n"
+        "✅ Telegram connection working\n"
+        "✅ NSE scanner loaded\n"
+        "✅ BOSS filter loaded\n"
+        "✅ Fundamental Score loaded\n\n"
 
         "🔒 BOSS FILTER\n"
         "IEP Change ≥ +2%\n"
@@ -171,16 +186,11 @@ def test_message():
         "Buy Qty ≥ 50,000\n"
         "Series = EQ\n\n"
 
-        "💎 FUNDAMENTAL FILTER\n"
-        "Market Cap ≥ ₹2,000 Cr\n"
-        "ROE ≥ 12%\n"
-        "ROCE ≥ 15%\n"
-        "Debt/Equity ≤ 0.50\n"
-        "Sales Growth ≥ 10%\n"
-        "Profit Growth ≥ 10%\n"
-        "Pledge ≤ 5%\n\n"
+        "💎 GEM SCORE\n"
+        "Minimum Score = 4/7\n"
+        "Strong GEM = 5/7+\n\n"
 
-        "⏰ 09:00 AM – 09:08 AM IST\n"
+        "⏰ 09:00–09:08 AM IST\n"
         "🔄 Every 30 seconds\n\n"
 
         "💻 Made by Prakash Kanki"
@@ -194,6 +204,7 @@ def test_message():
 def get_nse_data():
 
     try:
+
         response = nse_session.get(
             NSE_URL,
             params={"key": "ALL"},
@@ -201,21 +212,34 @@ def get_nse_data():
         )
 
         if response.status_code != 200:
-            print("NSE ERROR:", response.status_code)
+
+            print(
+                "NSE ERROR:",
+                response.status_code
+            )
+
             return []
 
-        data = response.json().get("data", [])
+        data = response.json().get(
+            "data",
+            []
+        )
 
         return data
 
     except Exception as e:
-        print("NSE connection error:", e)
+
+        print(
+            "NSE connection error:",
+            e
+        )
+
         return []
 
 
 # ============================================================
-# BOSS FILTER
-# 🔒 DO NOT CHANGE
+# 🔒 BOSS FILTER
+# EXACTLY SAME
 # ============================================================
 
 def scan_boss_stocks(data):
@@ -224,27 +248,49 @@ def scan_boss_stocks(data):
 
     for item in data:
 
-        metadata = item.get("metadata", {})
-        market = item.get("detail", {}).get(
-            "preOpenMarket", {}
+        metadata = item.get(
+            "metadata",
+            {}
         )
 
-        symbol = metadata.get("symbol")
-        series = metadata.get("series")
+        market = item.get(
+            "detail",
+            {}
+        ).get(
+            "preOpenMarket",
+            {}
+        )
 
-        iep = metadata.get("iep", 0) or 0
-        change = metadata.get("pChange", 0) or 0
+        symbol = metadata.get(
+            "symbol"
+        )
+
+        series = metadata.get(
+            "series"
+        )
+
+        iep = metadata.get(
+            "iep",
+            0
+        ) or 0
+
+        change = metadata.get(
+            "pChange",
+            0
+        ) or 0
 
         buy_qty = market.get(
-            "totalBuyQuantity", 0
+            "totalBuyQuantity",
+            0
         ) or 0
 
         sell_qty = market.get(
-            "totalSellQuantity", 0
+            "totalSellQuantity",
+            0
         ) or 0
 
         # ====================================================
-        # 🔒 BOSS FILTER — EXACTLY SAME
+        # 🔒 BOSS FILTER — NEVER CHANGE
         # ====================================================
 
         if series != "EQ":
@@ -295,13 +341,16 @@ def scan_boss_stocks(data):
 def get_fundamentals(symbol):
 
     if symbol in fundamental_cache:
+
         return fundamental_cache[symbol]
 
     try:
 
         import yfinance as yf
 
-        ticker = yf.Ticker(symbol + ".NS")
+        ticker = yf.Ticker(
+            symbol + ".NS"
+        )
 
         info = ticker.info
 
@@ -313,48 +362,52 @@ def get_fundamentals(symbol):
             "returnOnEquity"
         )
 
+        roce = info.get(
+            "returnOnCapitalEmployed"
+        )
+
         debt_equity = info.get(
             "debtToEquity"
         )
-
-        # Yahoo gives ROE as decimal
-        if roe is not None:
-            roe = roe * 100
-
-        # Yahoo debt/equity is normally in percentage
-        if debt_equity is not None:
-            debt_equity = debt_equity / 100
-
-        # ----------------------------------------------------
-        # ROCE / growth may not always be available in Yahoo.
-        # Try additional financial statements.
-        # ----------------------------------------------------
-
-        roce = info.get("returnOnCapitalEmployed")
-
-        if roce is not None:
-            roce = roce * 100
 
         sales_growth = info.get(
             "revenueGrowth"
         )
 
-        if sales_growth is not None:
-            sales_growth = sales_growth * 100
-
         profit_growth = info.get(
             "earningsGrowth"
         )
-
-        if profit_growth is not None:
-            profit_growth = profit_growth * 100
 
         pledge = info.get(
             "pledgedShares"
         )
 
+        # ----------------------------------------------------
+        # Convert decimals to %
+        # ----------------------------------------------------
+
+        if roe is not None:
+            roe = roe * 100
+
+        if roce is not None:
+            roce = roce * 100
+
+        if sales_growth is not None:
+            sales_growth = sales_growth * 100
+
+        if profit_growth is not None:
+            profit_growth = profit_growth * 100
+
         if pledge is not None:
             pledge = pledge * 100
+
+        # ----------------------------------------------------
+        # Debt/Equity
+        # Yahoo commonly returns this as percentage
+        # ----------------------------------------------------
+
+        if debt_equity is not None:
+            debt_equity = debt_equity / 100
 
         fundamentals = {
             "market_cap": market_cap,
@@ -369,7 +422,7 @@ def get_fundamentals(symbol):
         fundamental_cache[symbol] = fundamentals
 
         print(
-            "Fundamental:",
+            "Fundamentals:",
             symbol,
             fundamentals
         )
@@ -384,143 +437,272 @@ def get_fundamentals(symbol):
             e
         )
 
-        fundamental_cache[symbol] = None
+        fundamental_cache[symbol] = {}
 
-        return None
+        return {}
 
 
 # ============================================================
-# FUNDAMENTAL QUALITY CHECK
+# 💎 QUALITY SCORE
 # ============================================================
 
-def passes_fundamental_filter(symbol):
+def calculate_quality_score(symbol):
 
-    fundamentals = get_fundamentals(symbol)
+    f = get_fundamentals(symbol)
 
-    if not fundamentals:
-        return False
+    score = 0
 
-    market_cap = fundamentals.get(
+    reasons = []
+
+    # --------------------------------------------------------
+    # MARKET CAP
+    # --------------------------------------------------------
+
+    market_cap = f.get(
         "market_cap"
     )
 
-    roe = fundamentals.get(
-        "roe"
-    )
+    if market_cap is not None:
 
-    roce = fundamentals.get(
-        "roce"
-    )
+        if market_cap >= MIN_MARKET_CAP:
 
-    debt_equity = fundamentals.get(
-        "debt_equity"
-    )
-
-    sales_growth = fundamentals.get(
-        "sales_growth"
-    )
-
-    profit_growth = fundamentals.get(
-        "profit_growth"
-    )
-
-    pledge = fundamentals.get(
-        "pledge"
-    )
-
-    # --------------------------------------------------------
-    # Missing fundamental data = reject
-    # --------------------------------------------------------
-
-    required = [
-        market_cap,
-        roe,
-        roce,
-        debt_equity,
-        sales_growth,
-        profit_growth,
-        pledge
-    ]
-
-    if any(value is None for value in required):
-        print(
-            symbol,
-            "❌ Fundamental data incomplete"
-        )
-        return False
-
-    # --------------------------------------------------------
-    # QUALITY FILTER
-    # --------------------------------------------------------
-
-    if market_cap < MIN_MARKET_CAP:
-        return False
-
-    if roe < MIN_ROE:
-        return False
-
-    if roce < MIN_ROCE:
-        return False
-
-    if debt_equity > MAX_DEBT_EQUITY:
-        return False
-
-    if sales_growth < MIN_SALES_GROWTH:
-        return False
-
-    if profit_growth < MIN_PROFIT_GROWTH:
-        return False
-
-    if pledge > MAX_PLEDGE:
-        return False
-
-    return True
-
-
-# ============================================================
-# APPLY FUNDAMENTAL FILTER
-# ============================================================
-
-def filter_quality_stocks(boss_stocks):
-
-    quality = []
-
-    for stock in boss_stocks:
-
-        symbol = stock["symbol"]
-
-        print(
-            "Checking fundamentals:",
-            symbol
-        )
-
-        if passes_fundamental_filter(symbol):
-
-            fundamentals = fundamental_cache.get(
-                symbol
-            )
-
-            stock["fundamentals"] = fundamentals
-
-            quality.append(stock)
-
-            print(
-                "💎 QUALITY PASS:",
-                symbol
+            score += 1
+            reasons.append(
+                "Market Cap ✓"
             )
 
         else:
 
-            print(
-                "❌ QUALITY FAIL:",
-                symbol
+            # Too small = reject
+            return {
+                "score": 0,
+                "status": "REJECT",
+                "reason": "Market Cap < ₹500 Cr",
+                "data": f
+            }
+
+    else:
+
+        # Missing market cap = cannot verify size
+        return {
+            "score": 0,
+            "status": "REJECT",
+            "reason": "Market Cap unavailable",
+            "data": f
+        }
+
+    # --------------------------------------------------------
+    # ROE
+    # --------------------------------------------------------
+
+    roe = f.get(
+        "roe"
+    )
+
+    if roe is not None:
+
+        if roe >= 12:
+
+            score += 1
+            reasons.append(
+                "ROE ✓"
             )
 
-    return quality
+    # --------------------------------------------------------
+    # ROCE
+    # --------------------------------------------------------
+
+    roce = f.get(
+        "roce"
+    )
+
+    if roce is not None:
+
+        if roce >= 15:
+
+            score += 1
+            reasons.append(
+                "ROCE ✓"
+            )
+
+    # --------------------------------------------------------
+    # DEBT/EQUITY
+    # --------------------------------------------------------
+
+    debt_equity = f.get(
+        "debt_equity"
+    )
+
+    if debt_equity is not None:
+
+        if debt_equity <= 0.50:
+
+            score += 1
+            reasons.append(
+                "Low Debt ✓"
+            )
+
+    # --------------------------------------------------------
+    # SALES GROWTH
+    # --------------------------------------------------------
+
+    sales_growth = f.get(
+        "sales_growth"
+    )
+
+    if sales_growth is not None:
+
+        if sales_growth >= 10:
+
+            score += 1
+            reasons.append(
+                "Sales Growth ✓"
+            )
+
+    # --------------------------------------------------------
+    # PROFIT GROWTH
+    # --------------------------------------------------------
+
+    profit_growth = f.get(
+        "profit_growth"
+    )
+
+    if profit_growth is not None:
+
+        if profit_growth >= 10:
+
+            score += 1
+            reasons.append(
+                "Profit Growth ✓"
+            )
+
+    # --------------------------------------------------------
+    # PLEDGE
+    # --------------------------------------------------------
+
+    pledge = f.get(
+        "pledge"
+    )
+
+    if pledge is not None:
+
+        if pledge <= 5:
+
+            score += 1
+            reasons.append(
+                "Low Pledge ✓"
+            )
+
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
+
+    if score >= MIN_STRONG_SCORE:
+
+        status = "STRONG GEM"
+
+    elif score >= MIN_GEM_SCORE:
+
+        status = "GEM"
+
+    else:
+
+        status = "BOSS ONLY"
+
+    return {
+        "score": score,
+        "status": status,
+        "reason": reasons,
+        "data": f
+    }
 
 
 # ============================================================
-# TELEGRAM STOCK MESSAGE
+# APPLY QUALITY SCORE
+# ============================================================
+
+def apply_quality_score(boss_stocks):
+
+    gems = []
+
+    for stock in boss_stocks:
+
+        symbol = stock[
+            "symbol"
+        ]
+
+        print(
+            "💎 Quality checking:",
+            symbol
+        )
+
+        quality = calculate_quality_score(
+            symbol
+        )
+
+        score = quality[
+            "score"
+        ]
+
+        status = quality[
+            "status"
+        ]
+
+        stock[
+            "quality_score"
+        ] = score
+
+        stock[
+            "quality_status"
+        ] = status
+
+        stock[
+            "quality_reasons"
+        ] = quality.get(
+            "reason",
+            []
+        )
+
+        stock[
+            "fundamentals"
+        ] = quality.get(
+            "data",
+            {}
+        )
+
+        print(
+            symbol,
+            "Score:",
+            score,
+            "/7",
+            status
+        )
+
+        # ----------------------------------------------------
+        # Only GEM 4+ goes to Telegram
+        # ----------------------------------------------------
+
+        if score >= MIN_GEM_SCORE:
+
+            gems.append(
+                stock
+            )
+
+    gems.sort(
+        key=lambda x: (
+            x["quality_score"],
+            x["change"],
+            x["ratio"],
+            x["buy"]
+        ),
+        reverse=True
+    )
+
+    return gems
+
+
+# ============================================================
+# TELEGRAM GEM MESSAGE
 # ============================================================
 
 def create_stock_message(stocks):
@@ -529,16 +711,19 @@ def create_stock_message(stocks):
 
     message = (
         "💎 PREOPEN GEMS OFFICIAL\n"
-        "🔥 BOSS + FUNDAMENTAL GEM\n\n"
+        "🔥 FUNDAMENTAL + BOSS GEM\n\n"
 
-        f"📅 {current.strftime('%d-%b-%Y')}\n"
-        f"⏰ {current.strftime('%I:%M:%S %p')} IST\n\n"
+        f"📅 "
+        f"{current.strftime('%d-%b-%Y')}\n"
 
-        "💎 FUNDAMENTALLY STRONG + "
-        "PRE-OPEN BUYING\n\n"
+        f"⏰ "
+        f"{current.strftime('%I:%M:%S %p')} IST\n\n"
     )
 
-    for i, stock in enumerate(stocks[:10], 1):
+    for i, stock in enumerate(
+        stocks[:10],
+        1
+    ):
 
         f = stock.get(
             "fundamentals",
@@ -546,78 +731,151 @@ def create_stock_message(stocks):
         )
 
         market_cap = f.get(
-            "market_cap", 0
+            "market_cap"
         )
 
-        market_cap_cr = (
-            market_cap / 10_000_000
+        if market_cap:
+
+            market_cap_cr = (
+                market_cap / 10_000_000
+            )
+
+            market_text = (
+                f"₹{market_cap_cr:,.0f} Cr"
+            )
+
+        else:
+
+            market_text = "N/A"
+
+        roe = f.get(
+            "roe"
         )
 
-        roe = f.get("roe", 0)
-        roce = f.get("roce", 0)
-        de = f.get("debt_equity", 0)
-        sales = f.get("sales_growth", 0)
-        profit = f.get("profit_growth", 0)
-        pledge = f.get("pledge", 0)
+        roce = f.get(
+            "roce"
+        )
+
+        de = f.get(
+            "debt_equity"
+        )
+
+        sales = f.get(
+            "sales_growth"
+        )
+
+        profit = f.get(
+            "profit_growth"
+        )
+
+        pledge = f.get(
+            "pledge"
+        )
+
+        score = stock[
+            "quality_score"
+        ]
+
+        status = stock[
+            "quality_status"
+        ]
 
         message += (
             f"{i}️⃣ {stock['symbol']}\n"
 
-            f"IEP       : "
+            f"Signal     : 💎 {status}\n"
+
+            f"Quality    : "
+            f"{score}/7\n"
+
+            f"IEP        : "
             f"₹{stock['iep']:,.2f}\n"
 
-            f"Change    : "
+            f"Change     : "
             f"+{stock['change']:.2f}%\n"
 
-            f"Buy Qty   : "
+            f"Buy Qty    : "
             f"{stock['buy']:,}\n"
 
-            f"Sell Qty  : "
+            f"Sell Qty   : "
             f"{stock['sell']:,}\n"
 
-            f"B/S Ratio : "
+            f"B/S Ratio  : "
             f"{stock['ratio']:.2f}x\n"
 
-            f"Market Cap: "
-            f"₹{market_cap_cr:,.0f} Cr\n"
+            f"Market Cap : "
+            f"{market_text}\n"
 
-            f"ROE       : "
+            f"ROE        : "
             f"{roe:.1f}%\n"
-
-            f"ROCE      : "
-            f"{roce:.1f}%\n"
-
-            f"D/E       : "
-            f"{de:.2f}\n"
-
-            f"Sales Gr.  : "
-            f"{sales:.1f}%\n"
-
-            f"Profit Gr. : "
-            f"{profit:.1f}%\n"
-
-            f"Pledge     : "
-            f"{pledge:.1f}%\n"
-
-            f"Signal    : 💎 GEM\n\n"
+            if roe is not None
+            else
+            "ROE        : N/A\n"
         )
+
+        message += (
+            f"ROCE       : "
+            f"{roce:.1f}%\n"
+            if roce is not None
+            else
+            "ROCE       : N/A\n"
+        )
+
+        message += (
+            f"D/E        : "
+            f"{de:.2f}\n"
+            if de is not None
+            else
+            "D/E        : N/A\n"
+        )
+
+        message += (
+            f"Sales Gr.   : "
+            f"{sales:.1f}%\n"
+            if sales is not None
+            else
+            "Sales Gr.   : N/A\n"
+        )
+
+        message += (
+            f"Profit Gr.  : "
+            f"{profit:.1f}%\n"
+            if profit is not None
+            else
+            "Profit Gr.  : N/A\n"
+        )
+
+        message += (
+            f"Pledge      : "
+            f"{pledge:.1f}%\n"
+            if pledge is not None
+            else
+            "Pledge      : N/A\n"
+        )
+
+        message += "\n"
 
     message += (
         "━━━━━━━━━━━━━━━━━━\n"
+
         "🔒 BOSS FILTER\n"
         "IEP Change ≥ +2%\n"
         "B/S Ratio ≥ 3.0x\n"
         "Buy Qty ≥ 50,000\n"
         "Series = EQ\n\n"
 
-        "💎 QUALITY FILTER\n"
-        "Market Cap ≥ ₹2,000 Cr\n"
-        "ROE ≥ 12%\n"
-        "ROCE ≥ 15%\n"
-        "D/E ≤ 0.50\n"
-        "Sales Growth ≥ 10%\n"
-        "Profit Growth ≥ 10%\n"
-        "Pledge ≤ 5%\n"
+        "💎 QUALITY SCORE\n"
+        "Market Cap ≥ ₹500 Cr\n"
+        "ROE ≥ 12% = +1\n"
+        "ROCE ≥ 15% = +1\n"
+        "D/E ≤ 0.50 = +1\n"
+        "Sales Growth ≥ 10% = +1\n"
+        "Profit Growth ≥ 10% = +1\n"
+        "Pledge ≤ 5% = +1\n\n"
+
+        "💎 GEM = 4/7+\n"
+        "🔥 STRONG GEM = 5/7+\n"
+
         "━━━━━━━━━━━━━━━━━━\n\n"
 
         "⚠️ Pre-open data is indicative.\n"
@@ -632,9 +890,6 @@ def create_stock_message(stocks):
 # ============================================================
 # TELEGRAM COMMANDS
 # ============================================================
-
-telegram_offset = 0
-
 
 def handle_telegram_commands():
 
@@ -652,6 +907,7 @@ def handle_telegram_commands():
         )
 
         if response.status_code != 200:
+
             return
 
         updates = response.json().get(
@@ -680,12 +936,16 @@ def handle_telegram_commands():
             chat_id = message.get(
                 "chat",
                 {}
-            ).get("id")
+            ).get(
+                "id"
+            )
 
             if not chat_id:
                 continue
 
-            if text.startswith("/start"):
+            if text.startswith(
+                "/start"
+            ):
 
                 send_telegram(
                     start_message(),
@@ -696,7 +956,9 @@ def handle_telegram_commands():
                     "Received /start"
                 )
 
-            elif text.startswith("/test"):
+            elif text.startswith(
+                "/test"
+            ):
 
                 send_telegram(
                     test_message(),
@@ -721,18 +983,26 @@ def handle_telegram_commands():
 
 def run_scanner():
 
-    global telegram_offset
-
-    telegram_offset = 0
-
     print("\n")
-    print("==============================================")
-    print("      PREOPEN GEMS OFFICIAL")
-    print("      NSE BOSS + FUNDAMENTAL BOT")
-    print("==============================================")
+    print(
+        "=============================================="
+    )
 
-    print("🔒 BOSS FILTER LOCKED")
-    print("----------------------------------------------")
+    print(
+        "       PREOPEN GEMS OFFICIAL"
+    )
+
+    print(
+        "       BOSS + QUALITY SCORE BOT"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "🔒 BOSS FILTER LOCKED"
+    )
 
     print(
         "IEP Change : >=",
@@ -761,46 +1031,28 @@ def run_scanner():
         "seconds"
     )
 
-    print("----------------------------------------------")
-    print("💎 FUNDAMENTAL FILTER")
     print(
-        "Market Cap : >=",
-        "₹2,000 Cr"
-    )
-    print(
-        "ROE        : >=",
-        MIN_ROE,
-        "%"
-    )
-    print(
-        "ROCE       : >=",
-        MIN_ROCE,
-        "%"
-    )
-    print(
-        "Debt/Equity:",
-        "<=",
-        MAX_DEBT_EQUITY
-    )
-    print(
-        "Sales Growth:",
-        ">=",
-        MIN_SALES_GROWTH,
-        "%"
-    )
-    print(
-        "Profit Growth:",
-        ">=",
-        MIN_PROFIT_GROWTH,
-        "%"
-    )
-    print(
-        "Pledge      : <=",
-        MAX_PLEDGE,
-        "%"
+        "----------------------------------------------"
     )
 
-    print("==============================================")
+    print(
+        "💎 GEM SCORE:",
+        f"{MIN_GEM_SCORE}/7+"
+    )
+
+    print(
+        "🔥 STRONG GEM:",
+        f"{MIN_STRONG_SCORE}/7+"
+    )
+
+    print(
+        "Min Market Cap:",
+        "₹500 Cr"
+    )
+
+    print(
+        "=============================================="
+    )
 
     send_telegram(
         "🤖 PREOPEN GEMS OFFICIAL\n\n"
@@ -808,7 +1060,7 @@ def run_scanner():
         "✅ Telegram connected!\n"
         "✅ NSE scanner ready!\n"
         "✅ BOSS filter loaded!\n"
-        "✅ Fundamental filter loaded!\n\n"
+        "✅ Quality Score loaded!\n\n"
         "⏰ Scanner:\n"
         "09:00–09:08 AM IST\n"
         "🔄 Every 30 seconds\n\n"
@@ -816,7 +1068,7 @@ def run_scanner():
     )
 
     # ========================================================
-    # WAIT FOR 09:00 IST
+    # WAIT FOR 09:00
     # ========================================================
 
     while True:
@@ -830,6 +1082,7 @@ def run_scanner():
         )
 
         if current_time >= "09:00:00":
+
             break
 
         print(
@@ -840,16 +1093,18 @@ def run_scanner():
         time.sleep(5)
 
     # ========================================================
-    # PRE-OPEN START
+    # START
     # ========================================================
 
-    print("\n🔥 PRE-OPEN SCANNING STARTED")
+    print(
+        "\n🔥 PRE-OPEN SCANNING STARTED"
+    )
 
     alerted_stocks.clear()
     fundamental_cache.clear()
 
     # ========================================================
-    # SCAN UNTIL 09:08
+    # 09:00 → 09:08
     # ========================================================
 
     while True:
@@ -863,13 +1118,13 @@ def run_scanner():
         )
 
         if current_time >= "09:08:00":
+
             break
 
-        print("\nScanning NSE...", current_time)
-
-        # ----------------------------------------------------
-        # NSE DATA
-        # ----------------------------------------------------
+        print(
+            "\nScanning NSE...",
+            current_time
+        )
 
         data = get_nse_data()
 
@@ -881,7 +1136,7 @@ def run_scanner():
         if not data:
 
             print(
-                "No NSE data received."
+                "No NSE data."
             )
 
             time.sleep(
@@ -903,40 +1158,30 @@ def run_scanner():
             len(boss_stocks)
         )
 
-        if not boss_stocks:
-
-            print(
-                "No BOSS stocks."
-            )
-
-            time.sleep(
-                SCAN_INTERVAL
-            )
-
-            continue
-
         # ----------------------------------------------------
-        # STEP 2 — FUNDAMENTAL QUALITY
+        # STEP 2 — QUALITY SCORE
         # ----------------------------------------------------
 
-        quality_stocks = filter_quality_stocks(
+        gems = apply_quality_score(
             boss_stocks
         )
 
         print(
-            "💎 Quality stocks:",
-            len(quality_stocks)
+            "💎 GEM stocks:",
+            len(gems)
         )
 
         # ----------------------------------------------------
-        # STEP 3 — NEW GEM ALERT
+        # STEP 3 — NEW GEM
         # ----------------------------------------------------
 
-        new_stocks = []
+        new_gems = []
 
-        for stock in quality_stocks:
+        for stock in gems:
 
-            symbol = stock["symbol"]
+            symbol = stock[
+                "symbol"
+            ]
 
             if symbol not in alerted_stocks:
 
@@ -944,7 +1189,7 @@ def run_scanner():
                     symbol
                 )
 
-                new_stocks.append(
+                new_gems.append(
                     stock
                 )
 
@@ -952,34 +1197,35 @@ def run_scanner():
         # TELEGRAM
         # ----------------------------------------------------
 
-        if new_stocks:
+        if new_gems:
 
             print(
-                "\n💎 NEW FUNDAMENTAL GEMS"
+                "\n💎 NEW GEMS"
             )
 
-            for stock in new_stocks:
+            for stock in new_gems:
 
                 print(
                     stock["symbol"],
+                    "| Score:",
+                    stock["quality_score"],
+                    "/7",
                     "|",
                     f"{stock['change']:.2f}%",
-                    "| Buy:",
-                    f"{stock['buy']:,}",
                     "| B/S:",
                     f"{stock['ratio']:.2f}x"
                 )
 
             send_telegram(
                 create_stock_message(
-                    new_stocks
+                    new_gems
                 )
             )
 
         else:
 
             print(
-                "No NEW Fundamental Gem."
+                "No NEW GEM."
             )
 
         time.sleep(
@@ -987,13 +1233,21 @@ def run_scanner():
         )
 
     # ========================================================
-    # SESSION FINISHED
+    # FINISHED
     # ========================================================
 
     print("\n")
-    print("==============================================")
-    print(" NSE PRE-OPEN SESSION FINISHED")
-    print("==============================================")
+    print(
+        "=============================================="
+    )
+
+    print(
+        " NSE PRE-OPEN SESSION FINISHED"
+    )
+
+    print(
+        "=============================================="
+    )
 
     send_telegram(
         "🏁 PREOPEN GEMS OFFICIAL\n\n"
@@ -1003,7 +1257,7 @@ def run_scanner():
         f"⏰ "
         f"{now_ist().strftime('%I:%M:%S %p')} IST\n"
 
-        f"💎 Fundamental Gems: "
+        f"💎 GEM stocks detected: "
         f"{len(alerted_stocks)}\n\n"
 
         "Scanner stopped for today.\n\n"
@@ -1021,7 +1275,7 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
 
         print(
-            "ERROR: TELEGRAM_BOT_TOKEN is missing."
+            "ERROR: TELEGRAM_BOT_TOKEN missing."
         )
 
         raise SystemExit(1)
@@ -1029,7 +1283,7 @@ if __name__ == "__main__":
     if not CHAT_ID:
 
         print(
-            "ERROR: TELEGRAM_CHAT_ID is missing."
+            "ERROR: TELEGRAM_CHAT_ID missing."
         )
 
         raise SystemExit(1)
