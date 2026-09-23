@@ -8,8 +8,7 @@ from zoneinfo import ZoneInfo
 
 # ============================================================
 # PREOPEN GEMS OFFICIAL
-# BOSS FILTER = LOCKED
-# Buyer Priority + Fundamental Quality Ranking
+# BOSS + BUYER PRIORITY + QUALITY + RISK PENALTY
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -20,13 +19,10 @@ NSE_HOME = "https://www.nseindia.com/"
 
 IST = ZoneInfo("Asia/Kolkata")
 
-SCAN_START = (9, 0)
-SCAN_END = (9, 8)
-
 SCAN_INTERVAL = 30
 
 # ============================================================
-# 🔒 BOSS FILTER - DO NOT CHANGE
+# 🔒 BOSS FILTER — LOCKED
 # ============================================================
 
 BOSS_MIN_CHANGE = 2.0
@@ -35,25 +31,27 @@ BOSS_MIN_BUY_QTY = 50000
 BOSS_SERIES = "EQ"
 
 # ============================================================
-# OUTPUT LIMIT
+# OUTPUT
 # ============================================================
 
 MIN_GEMS = 1
 MAX_GEMS = 10
 
 # ============================================================
-# FUNDAMENTAL BASE FILTER
+# QUALITY / RISK SETTINGS
 # ============================================================
 
-MIN_MARKET_CAP = 500       # ₹ Crore
-MIN_SALES_GROWTH = 0
-MIN_PROFIT_GROWTH = 0
+MIN_MARKET_CAP_PREFERRED = 500       # ₹ Cr
+MIN_MARKET_CAP_STRONG = 1000         # ₹ Cr
+
+LOW_PRICE = 50
+VERY_LOW_PRICE = 20
+
+MIN_BUY_QTY = 50000
 
 # ============================================================
-# GLOBAL CACHE
+# SESSION
 # ============================================================
-
-fundamental_cache = {}
 
 nse_session = requests.Session()
 
@@ -70,6 +68,14 @@ nse_headers = {
 }
 
 # ============================================================
+# CACHE
+# ============================================================
+
+fundamental_cache = {}
+price_cache = {}
+
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
@@ -79,152 +85,38 @@ def telegram_send(message):
         print("Telegram credentials missing")
         return False
 
-    # Railway variable can contain multiple Chat IDs:
-    # 1391074551,7418177111
-
-    chat_ids = [
-        x.strip()
-        for x in TELEGRAM_CHAT_ID.split(",")
-        if x.strip()
-    ]
-
     url = (
         f"https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    success = False
-
-    for chat_id in chat_ids:
-
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "disable_web_page_preview": True,
-        }
-
-        try:
-
-            r = requests.post(
-                url,
-                data=payload,
-                timeout=15
-            )
-
-            if r.status_code == 200:
-
-                print(
-                    f"Telegram sent successfully → {chat_id}"
-                )
-
-                success = True
-
-            else:
-
-                print(
-                    f"Telegram error → {chat_id}:",
-                    r.status_code,
-                    r.text[:500]
-                )
-
-        except Exception as e:
-
-            print(
-                f"Telegram exception → {chat_id}:",
-                e
-            )
-
-    return success
-
-
-# ============================================================
-# TIME
-# ============================================================
-
-def now_ist():
-
-    return datetime.now(IST)
-
-
-def in_preopen():
-
-    now = now_ist()
-
-    current = (
-        now.hour,
-        now.minute
-    )
-
-    start = SCAN_START
-    end = SCAN_END
-
-    return start <= current <= end
-
-
-# ============================================================
-# NSE DATA
-# ============================================================
-
-def get_nse_data():
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
 
     try:
 
-        # Establish NSE session
-
-        try:
-
-            nse_session.get(
-                NSE_HOME,
-                headers=nse_headers,
-                timeout=10
-            )
-
-        except Exception:
-
-            pass
-
-        r = nse_session.get(
-            NSE_URL,
-            headers=nse_headers,
+        r = requests.post(
+            url,
+            data=payload,
             timeout=15
         )
 
-        if r.status_code != 200:
+        if r.status_code == 200:
+            return True
 
-            print(
-                "NSE HTTP:",
-                r.status_code
-            )
-
-            return []
-
-        data = r.json()
-
-        if isinstance(data, dict):
-
-            records = data.get(
-                "data",
-                []
-            )
-
-        else:
-
-            records = data
-
-        return records
+        print("Telegram error:", r.status_code, r.text[:500])
+        return False
 
     except Exception as e:
-
-        print(
-            "NSE error:",
-            e
-        )
-
-        return []
+        print("Telegram exception:", e)
+        return False
 
 
 # ============================================================
-# SAFE NUMBER
+# NUMBER HELPERS
 # ============================================================
 
 def num(value, default=0):
@@ -236,49 +128,73 @@ def num(value, default=0):
 
         if isinstance(value, str):
 
-            value = value.replace(
-                ",",
-                ""
-            ).strip()
+            value = value.replace(",", "").strip()
 
-            if value in (
-                "",
-                "-",
-                "N/A",
-                "NA",
-                "None"
-            ):
-
+            if value in ("", "-", "N/A", "NA", "None"):
                 return default
 
         return float(value)
 
     except Exception:
-
         return default
 
 
-def clean_value(value):
+def clean(value):
 
     try:
 
         if value is None:
             return None
 
-        if isinstance(value, float):
+        value = float(value)
 
-            if (
-                math.isnan(value)
-                or math.isinf(value)
-            ):
+        if math.isnan(value) or math.isinf(value):
+            return None
 
-                return None
-
-        return float(value)
+        return value
 
     except Exception:
-
         return None
+
+
+# ============================================================
+# NSE
+# ============================================================
+
+def get_nse_data():
+
+    try:
+
+        try:
+            nse_session.get(
+                NSE_HOME,
+                headers=nse_headers,
+                timeout=10
+            )
+        except Exception:
+            pass
+
+        r = nse_session.get(
+            NSE_URL,
+            headers=nse_headers,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            print("NSE HTTP:", r.status_code)
+            return []
+
+        data = r.json()
+
+        if isinstance(data, dict):
+            return data.get("data", [])
+
+        return data
+
+    except Exception as e:
+
+        print("NSE error:", e)
+        return []
 
 
 # ============================================================
@@ -288,7 +204,6 @@ def clean_value(value):
 def get_fundamentals(symbol):
 
     if symbol in fundamental_cache:
-
         return fundamental_cache[symbol]
 
     result = {
@@ -299,337 +214,124 @@ def get_fundamentals(symbol):
         "sales_growth": None,
         "profit_growth": None,
         "pledge": None,
+        "price": None,
     }
 
     try:
 
-        ticker = yf.Ticker(
-            symbol + ".NS"
-        )
+        ticker = yf.Ticker(symbol + ".NS")
 
         info = ticker.info
 
-        # Market cap
+        # ----------------------------------------------------
+        # Market Cap
+        # ----------------------------------------------------
 
-        market_cap = info.get(
-            "marketCap"
+        market_cap = clean(
+            info.get("marketCap")
         )
 
         if market_cap is not None:
+            result["market_cap"] = market_cap / 10000000
 
-            result["market_cap"] = (
-                market_cap / 10000000
-            )
+        # ----------------------------------------------------
+        # Current Price
+        # ----------------------------------------------------
 
-        # ROE
-
-        result["roe"] = clean_value(
-            info.get(
-                "returnOnEquity"
-            )
+        price = clean(
+            info.get("currentPrice")
         )
 
-        if result["roe"] is not None:
+        if price is None:
+            price = clean(
+                info.get("regularMarketPrice")
+            )
 
-            result["roe"] *= 100
+        result["price"] = price
 
+        # ----------------------------------------------------
+        # ROE
+        # ----------------------------------------------------
+
+        roe = clean(
+            info.get("returnOnEquity")
+        )
+
+        if roe is not None:
+            result["roe"] = roe * 100
+
+        # ----------------------------------------------------
         # ROCE
+        # ----------------------------------------------------
 
-        roce = info.get(
-            "returnOnCapitalEmployed"
+        roce = clean(
+            info.get("returnOnCapitalEmployed")
         )
 
         if roce is not None:
 
-            result["roce"] = clean_value(
-                roce
-            )
+            if roce < 1:
+                roce *= 100
 
-            if (
-                result["roce"] is not None
-                and result["roce"] < 1
-            ):
+            result["roce"] = roce
 
-                result["roce"] *= 100
+        # ----------------------------------------------------
+        # D/E
+        # ----------------------------------------------------
 
-        # Debt / Equity
-
-        de = info.get(
-            "debtToEquity"
+        de = clean(
+            info.get("debtToEquity")
         )
 
         if de is not None:
 
-            result["de"] = clean_value(
-                de
-            )
+            # Yahoo can sometimes return 45.35
+            # instead of 0.4535
+            if de > 20:
+                de = de / 100
 
-            # yfinance sometimes gives
-            # percentage-style D/E
-            # e.g. 45.35 means 0.4535
+            result["de"] = de
 
-            if (
-                result["de"] is not None
-                and result["de"] > 20
-            ):
+        # ----------------------------------------------------
+        # Sales Growth
+        # ----------------------------------------------------
 
-                result["de"] = (
-                    result["de"] / 100
-                )
-
-        # Sales growth
-
-        sales_growth = info.get(
-            "revenueGrowth"
+        sales = clean(
+            info.get("revenueGrowth")
         )
 
-        if sales_growth is not None:
+        if sales is not None:
+            result["sales_growth"] = sales * 100
 
-            result["sales_growth"] = (
-                clean_value(
-                    sales_growth * 100
-                )
-            )
+        # ----------------------------------------------------
+        # Profit Growth
+        # ----------------------------------------------------
 
-        # Profit growth
-
-        profit_growth = info.get(
-            "earningsGrowth"
+        profit = clean(
+            info.get("earningsGrowth")
         )
 
-        if profit_growth is not None:
+        if profit is not None:
+            result["profit_growth"] = profit * 100
 
-            result["profit_growth"] = (
-                clean_value(
-                    profit_growth * 100
-                )
-            )
-
+        # ----------------------------------------------------
         # Pledge
+        # ----------------------------------------------------
 
-        pledge = info.get(
-            "pledgeRatio"
+        pledge = clean(
+            info.get("pledgeRatio")
         )
 
         if pledge is not None:
-
-            result["pledge"] = (
-                clean_value(
-                    pledge * 100
-                )
-            )
+            result["pledge"] = pledge * 100
 
     except Exception as e:
 
-        print(
-            f"Fundamental error {symbol}:",
-            e
-        )
+        print(f"Fundamental error {symbol}: {e}")
 
     fundamental_cache[symbol] = result
 
     return result
-
-
-# ============================================================
-# FUNDAMENTAL QUALITY SCORE
-# ============================================================
-
-def quality_score(f):
-
-    score = 0
-    passed = []
-    weak = []
-
-    # Market Cap
-
-    if f["market_cap"] is not None:
-
-        if f["market_cap"] >= 500:
-
-            score += 1
-            passed.append(
-                "Market Cap"
-            )
-
-    # Sales growth
-
-    if f["sales_growth"] is not None:
-
-        if f["sales_growth"] > 0:
-
-            score += 1
-            passed.append(
-                "Sales Growth"
-            )
-
-    # Profit growth
-
-    if f["profit_growth"] is not None:
-
-        if f["profit_growth"] > 0:
-
-            score += 1
-            passed.append(
-                "Profit Growth"
-            )
-
-    # D/E
-
-    if f["de"] is not None:
-
-        if f["de"] <= 1.0:
-
-            score += 1
-            passed.append(
-                "D/E"
-            )
-
-        else:
-
-            weak.append(
-                "D/E high"
-            )
-
-    # ROE
-
-    if f["roe"] is not None:
-
-        if f["roe"] >= 12:
-
-            score += 1
-            passed.append(
-                "ROE"
-            )
-
-    # ROCE
-
-    if f["roce"] is not None:
-
-        if f["roce"] >= 15:
-
-            score += 1
-            passed.append(
-                "ROCE"
-            )
-
-    # Pledge
-
-    if f["pledge"] is not None:
-
-        if f["pledge"] <= 5:
-
-            score += 1
-            passed.append(
-                "Pledge"
-            )
-
-    return score, passed, weak
-
-
-# ============================================================
-# BUYER STRENGTH
-# ============================================================
-
-def buyer_strength(
-    change,
-    ratio,
-    buy_qty
-):
-
-    # --------------------------------------------------------
-    # Ratio component
-    # Higher buyer/seller imbalance = higher score
-    # --------------------------------------------------------
-
-    if ratio <= 3:
-
-        ratio_score = 25
-
-    elif ratio >= 20:
-
-        ratio_score = 100
-
-    else:
-
-        ratio_score = 25 + (
-            (ratio - 3) / 17
-        ) * 75
-
-    # --------------------------------------------------------
-    # Buy quantity component
-    # Log scale prevents huge quantity from dominating
-    # --------------------------------------------------------
-
-    if buy_qty <= 50000:
-
-        qty_score = 20
-
-    else:
-
-        qty_score = min(
-            100,
-            20 + (
-                math.log10(
-                    buy_qty / 50000
-                ) * 40
-            )
-        )
-
-    # --------------------------------------------------------
-    # IEP Change
-    # --------------------------------------------------------
-
-    change_score = min(
-        100,
-        max(
-            0,
-            change * 4
-        )
-    )
-
-    # --------------------------------------------------------
-    # BUYER PRIORITY
-    # 70% buyer strength
-    # --------------------------------------------------------
-
-    score = (
-        ratio_score * 0.50
-        + qty_score * 0.30
-        + change_score * 0.20
-    )
-
-    return round(
-        score,
-        2
-    )
-
-
-# ============================================================
-# FINAL COMBINED SCORE
-# ============================================================
-
-def final_score(
-    buyer_score,
-    quality
-):
-
-    # Buyer is the main priority
-    # Fundamental quality is secondary
-
-    quality_score_value = (
-        quality / 7
-    ) * 100
-
-    final = (
-        buyer_score * 0.70
-        + quality_score_value * 0.30
-    )
-
-    return round(
-        final,
-        2
-    )
 
 
 # ============================================================
@@ -650,24 +352,15 @@ def boss_filter(record):
             {}
         )
 
-        symbol = metadata.get(
-            "symbol"
-        )
+        symbol = metadata.get("symbol")
+        series = metadata.get("series")
 
-        series = metadata.get(
-            "series"
+        change = num(
+            metadata.get("pChange")
         )
 
         iep = num(
-            metadata.get(
-                "iep"
-            )
-        )
-
-        change = num(
-            metadata.get(
-                "pChange"
-            )
+            metadata.get("iep")
         )
 
         preopen = detail.get(
@@ -688,63 +381,387 @@ def boss_filter(record):
         )
 
         if not symbol:
-
             return None
 
-        # 🔒 BOSS FILTER LOCKED
+        # ====================================================
+        # 🔒 BOSS — EXACTLY SAME
+        # ====================================================
 
         if series != BOSS_SERIES:
-
             return None
 
         if change < BOSS_MIN_CHANGE:
-
-            return None
-
-        if sell_qty <= 0:
-
-            return None
-
-        ratio = (
-            buy_qty / sell_qty
-        )
-
-        if ratio < BOSS_MIN_RATIO:
-
             return None
 
         if buy_qty < BOSS_MIN_BUY_QTY:
+            return None
 
+        if sell_qty <= 0:
+            return None
+
+        ratio = buy_qty / sell_qty
+
+        if ratio < BOSS_MIN_RATIO:
             return None
 
         return {
             "symbol": symbol,
             "series": series,
-            "iep": iep,
             "change": change,
+            "iep": iep,
             "buy_qty": buy_qty,
             "sell_qty": sell_qty,
             "ratio": ratio,
         }
 
     except Exception:
-
         return None
+
+
+# ============================================================
+# BUYER SCORE
+# ============================================================
+
+def buyer_score(item):
+
+    ratio = item["ratio"]
+    buy_qty = item["buy_qty"]
+    change = item["change"]
+
+    # --------------------------------------------------------
+    # Ratio
+    # --------------------------------------------------------
+
+    if ratio <= 3:
+        ratio_score = 25
+
+    elif ratio >= 25:
+        ratio_score = 100
+
+    else:
+
+        ratio_score = (
+            25
+            + ((ratio - 3) / 22) * 75
+        )
+
+    # --------------------------------------------------------
+    # Buy Quantity
+    # --------------------------------------------------------
+
+    if buy_qty <= 50000:
+
+        qty_score = 20
+
+    else:
+
+        qty_score = min(
+            100,
+            20 + (
+                math.log10(
+                    buy_qty / 50000
+                ) * 45
+            )
+        )
+
+    # --------------------------------------------------------
+    # Change
+    # --------------------------------------------------------
+
+    change_score = min(
+        100,
+        max(
+            0,
+            change * 4
+        )
+    )
+
+    # Buyer priority
+    score = (
+        ratio_score * 0.50
+        + qty_score * 0.30
+        + change_score * 0.20
+    )
+
+    return round(score, 2)
+
+
+# ============================================================
+# QUALITY SCORE
+# ============================================================
+
+def quality_score(f):
+
+    score = 0
+    reasons = []
+
+    # Market cap
+    if f["market_cap"] is not None:
+
+        if f["market_cap"] >= 1000:
+
+            score += 2
+            reasons.append("Strong Market Cap")
+
+        elif f["market_cap"] >= 500:
+
+            score += 1
+            reasons.append("Market Cap")
+
+    # Sales growth
+    if f["sales_growth"] is not None:
+
+        if f["sales_growth"] >= 10:
+
+            score += 1
+            reasons.append("Sales Growth")
+
+        elif f["sales_growth"] > 0:
+
+            score += 0.5
+
+    # Profit growth
+    if f["profit_growth"] is not None:
+
+        if f["profit_growth"] >= 10:
+
+            score += 1
+            reasons.append("Profit Growth")
+
+        elif f["profit_growth"] > 0:
+
+            score += 0.5
+
+    # ROE
+    if f["roe"] is not None:
+
+        if f["roe"] >= 12:
+
+            score += 1
+            reasons.append("ROE")
+
+    # ROCE
+    if f["roce"] is not None:
+
+        if f["roce"] >= 15:
+
+            score += 1
+            reasons.append("ROCE")
+
+    # D/E
+    if f["de"] is not None:
+
+        if f["de"] <= 0.50:
+
+            score += 1
+            reasons.append("Low D/E")
+
+        elif f["de"] <= 1.0:
+
+            score += 0.5
+
+    # Pledge
+    if f["pledge"] is not None:
+
+        if f["pledge"] <= 5:
+
+            score += 1
+            reasons.append("Low Pledge")
+
+    return round(score, 1), reasons
+
+
+# ============================================================
+# RISK PENALTY
+# ============================================================
+
+def risk_penalty(f):
+
+    penalty = 0
+    reasons = []
+
+    market_cap = f["market_cap"]
+    price = f["price"]
+
+    # --------------------------------------------------------
+    # Very small market cap
+    # --------------------------------------------------------
+
+    if market_cap is not None:
+
+        if market_cap < 100:
+
+            penalty += 25
+            reasons.append("Very Small Cap")
+
+        elif market_cap < 250:
+
+            penalty += 15
+            reasons.append("Small Cap")
+
+        elif market_cap < 500:
+
+            penalty += 7
+            reasons.append("Lower Market Cap")
+
+    # --------------------------------------------------------
+    # Very low price
+    # --------------------------------------------------------
+
+    if price is not None:
+
+        if price < VERY_LOW_PRICE:
+
+            penalty += 20
+            reasons.append("Very Low Price")
+
+        elif price < LOW_PRICE:
+
+            penalty += 8
+            reasons.append("Low Price")
+
+    # --------------------------------------------------------
+    # High debt
+    # --------------------------------------------------------
+
+    if f["de"] is not None:
+
+        if f["de"] > 3:
+
+            penalty += 15
+            reasons.append("High D/E")
+
+        elif f["de"] > 1:
+
+            penalty += 6
+            reasons.append("D/E > 1")
+
+    return penalty, reasons
+
+
+# ============================================================
+# FINAL SCORE
+# ============================================================
+
+def final_score(item):
+
+    bscore = buyer_score(item)
+
+    f = item["fundamentals"]
+
+    qscore, qreasons = quality_score(f)
+
+    penalty, preasons = risk_penalty(f)
+
+    # --------------------------------------------------------
+    # Buyer = 60%
+    # Quality = 30%
+    # Risk = 10%
+    # --------------------------------------------------------
+
+    quality_normalized = min(
+        100,
+        (qscore / 7) * 100
+    )
+
+    final = (
+        bscore * 0.60
+        + quality_normalized * 0.30
+        - penalty * 0.10
+    )
+
+    return {
+        "buyer_score": round(bscore, 2),
+        "quality_score": qscore,
+        "quality_reasons": qreasons,
+        "risk_penalty": penalty,
+        "risk_reasons": preasons,
+        "final_score": round(final, 2),
+    }
+
+
+# ============================================================
+# PROCESS
+# ============================================================
+
+def process_records(records):
+
+    candidates = []
+
+    for record in records:
+
+        item = boss_filter(record)
+
+        if not item:
+            continue
+
+        f = get_fundamentals(
+            item["symbol"]
+        )
+
+        item["fundamentals"] = f
+
+        scores = final_score(item)
+
+        item.update(scores)
+
+        candidates.append(item)
+
+    return candidates
+
+
+# ============================================================
+# SELECT TOP GEMS
+# ============================================================
+
+def select_gems(candidates):
+
+    if not candidates:
+        return []
+
+    # --------------------------------------------------------
+    # Sort by FINAL SCORE
+    # --------------------------------------------------------
+
+    candidates.sort(
+        key=lambda x: (
+            x["final_score"],
+            x["buyer_score"],
+            x["quality_score"],
+            x["ratio"]
+        ),
+        reverse=True
+    )
+
+    # --------------------------------------------------------
+    # Do not force 10 stocks
+    # Select stocks with reasonable score.
+    #
+    # Threshold is deliberately moderate to avoid ZERO.
+    # --------------------------------------------------------
+
+    good = [
+        x for x in candidates
+        if x["final_score"] >= 35
+    ]
+
+    # If less than 1 passes,
+    # take strongest BOSS candidate.
+    if not good:
+
+        return candidates[:1]
+
+    return good[:MAX_GEMS]
 
 
 # ============================================================
 # FORMAT
 # ============================================================
 
-def fmt_money(value):
+def fmt_cr(value):
 
     if value is None:
-
         return "N/A"
-
-    if value >= 1000:
-
-        return f"₹{value:,.0f} Cr"
 
     return f"₹{value:,.0f} Cr"
 
@@ -752,264 +769,93 @@ def fmt_money(value):
 def fmt_pct(value):
 
     if value is None:
-
         return "N/A"
 
     return f"{value:.1f}%"
 
 
-def fmt_number(value):
+def fmt_qty(value):
 
     return f"{int(value):,}"
 
 
 # ============================================================
-# SCAN
+# GEM MESSAGE
 # ============================================================
 
-def scan_once():
+def send_gem(item, rank):
 
-    records = get_nse_data()
+    f = item["fundamentals"]
 
-    print(
-        "NSE records:",
-        len(records)
+    risk = ", ".join(
+        item["risk_reasons"]
     )
 
-    boss_matches = []
-
-    for record in records:
-
-        item = boss_filter(
-            record
-        )
-
-        if item:
-
-            boss_matches.append(
-                item
-            )
-
-    print(
-        "BOSS matches:",
-        len(boss_matches)
-    )
-
-    candidates = []
-
-    for item in boss_matches:
-
-        symbol = item["symbol"]
-
-        f = get_fundamentals(
-            symbol
-        )
-
-        qscore, passed, weak = (
-            quality_score(f)
-        )
-
-        bscore = buyer_strength(
-            item["change"],
-            item["ratio"],
-            item["buy_qty"]
-        )
-
-        fscore = final_score(
-            bscore,
-            qscore
-        )
-
-        # Basic quality preference
-
-        quality_ok = False
-
-        if (
-            f["market_cap"] is not None
-            and f["market_cap"]
-            >= MIN_MARKET_CAP
-        ):
-
-            quality_ok = True
-
-        if (
-            f["sales_growth"] is not None
-            and f["sales_growth"]
-            > MIN_SALES_GROWTH
-        ):
-
-            quality_ok = True
-
-        if (
-            f["profit_growth"] is not None
-            and f["profit_growth"]
-            > MIN_PROFIT_GROWTH
-        ):
-
-            quality_ok = True
-
-        item.update({
-
-            "fundamentals": f,
-
-            "quality": qscore,
-
-            "buyer_score": bscore,
-
-            "final_score": fscore,
-
-            "passed": passed,
-
-            "weak": weak,
-
-            "quality_ok": quality_ok,
-
-        })
-
-        candidates.append(
-            item
-        )
-
-    # --------------------------------------------------------
-    # First preference:
-    # Fundamental-supported candidates
-    # --------------------------------------------------------
-
-    preferred = [
-        x for x in candidates
-        if x["quality_ok"]
-    ]
-
-    # --------------------------------------------------------
-    # Sort:
-    # Buyer strength first
-    # Final score second
-    # --------------------------------------------------------
-
-    preferred.sort(
-        key=lambda x: (
-            x["buyer_score"],
-            x["final_score"],
-            x["quality"]
-        ),
-        reverse=True
-    )
-
-    selected = preferred[
-        :MAX_GEMS
-    ]
-
-    # --------------------------------------------------------
-    # FALLBACK
-    # If no quality-supported stock exists,
-    # take strongest BOSS stock.
-    # --------------------------------------------------------
-
-    fallback = False
-
-    if (
-        len(selected) == 0
-        and candidates
-    ):
-
-        candidates.sort(
-            key=lambda x: (
-                x["buyer_score"],
-                x["final_score"]
-            ),
-            reverse=True
-        )
-
-        selected = candidates[
-            :1
-        ]
-
-        fallback = True
-
-    return {
-
-        "records": len(records),
-
-        "boss": boss_matches,
-
-        "candidates": candidates,
-
-        "selected": selected,
-
-        "fallback": fallback,
-
-    }
-
-
-# ============================================================
-# TELEGRAM GEM MESSAGE
-# ============================================================
-
-def send_gem_message(
-    item,
-    fallback=False
-):
-
-    f = item[
-        "fundamentals"
-    ]
-
-    label = "💎 GEM"
-
-    if fallback:
-
-        label = (
-            "⚠️ BOSS FALLBACK GEM"
-        )
+    if not risk:
+        risk = "Low Risk Penalty"
 
     message = f"""
-{label}
+💎 PREOPEN GEM #{rank}
 
 📌 {item['symbol']}
 
-🔥 BUYER PRIORITY
+━━━━━━━━━━━━━━━━━━
+👥 BUYER STRENGTH
+━━━━━━━━━━━━━━━━━━
 
 📈 IEP Change : +{item['change']:.2f}%
 ⚖️ B/S Ratio  : {item['ratio']:.2f}x
-🟢 Buy Qty    : {fmt_number(item['buy_qty'])}
-🔴 Sell Qty   : {fmt_number(item['sell_qty'])}
+🟢 Buy Qty    : {fmt_qty(item['buy_qty'])}
+🔴 Sell Qty   : {fmt_qty(item['sell_qty'])}
+
+⭐ Buyer Score : {item['buyer_score']}/100
 
 ━━━━━━━━━━━━━━━━━━
-
-⭐ BUYER SCORE : {item['buyer_score']:.1f}/100
-⭐ QUALITY     : {item['quality']}/7
-🏆 FINAL SCORE: {item['final_score']}/100
-
+🏦 FUNDAMENTALS
 ━━━━━━━━━━━━━━━━━━
 
-💰 Market Cap : {fmt_money(f['market_cap'])}
+💰 Market Cap : {fmt_cr(f['market_cap'])}
+
 ROE           : {fmt_pct(f['roe'])}
 ROCE          : {fmt_pct(f['roce'])}
-D/E           : {fmt_pct(f['de']) if f['de'] is not None else 'N/A'}
+
+D/E           : {
+    f"{f['de']:.2f}"
+    if f['de'] is not None
+    else "N/A"
+}
+
 Sales Growth  : {fmt_pct(f['sales_growth'])}
 Profit Growth : {fmt_pct(f['profit_growth'])}
 Pledge        : {fmt_pct(f['pledge'])}
 
+⭐ Quality     : {item['quality_score']}/7
+
+━━━━━━━━━━━━━━━━━━
+🛡️ RISK CHECK
 ━━━━━━━━━━━━━━━━━━
 
-🔒 BOSS FILTER: PASSED
-👥 BUYERS ARE PRIORITY
+{risk}
+
+🏆 FINAL SCORE : {item['final_score']}/100
+
+🔒 BOSS FILTER : PASSED
+👥 BUYER PRIORITY : HIGH
 
 💻 Made by Prakash Kanki
 """
 
-    telegram_send(
-        message
-    )
+    telegram_send(message)
 
 
 # ============================================================
 # STARTUP
 # ============================================================
 
-def send_startup():
+def startup_message():
 
-    message = """
+    telegram_send(
+"""
 🔥 PREOPEN GEMS OFFICIAL
 
 📡 PRE-OPEN BUYING SCANNER
@@ -1017,23 +863,19 @@ def send_startup():
 ✅ Bot is online
 ✅ Telegram connected
 ✅ NSE scanner ready
-🔒 BOSS filter loaded
-⭐ Buyer Priority loaded
-💎 Quality Ranking loaded
+
+🔒 BOSS FILTER LOCKED
+👥 Buyer Priority ACTIVE
+🏦 Quality Ranking ACTIVE
+🛡️ Risk Protection ACTIVE
 
 ⏰ Scanner: 09:00–09:08 AM IST
 🔄 Every 30 seconds
 
-👥 Buyer Priority: 70%
-🏦 Fundamental Quality: 30%
-
-📊 Output: Minimum 1 / Maximum 10
+📊 Output: 1–10 stocks
 
 💻 Made by Prakash Kanki
 """
-
-    telegram_send(
-        message
     )
 
 
@@ -1043,19 +885,15 @@ def send_startup():
 
 def main():
 
-    send_startup()
+    startup_message()
 
-    print(
-        "PREOPEN GEMS STARTED"
-    )
-
-    sent_symbols = set()
-
-    # Wait until 9:00
+    # --------------------------------------------------------
+    # Wait until 09:00
+    # --------------------------------------------------------
 
     while True:
 
-        now = now_ist()
+        now = datetime.now(IST)
 
         if (
             now.hour > 9
@@ -1064,13 +902,12 @@ def main():
                 and now.minute >= 0
             )
         ):
-
             break
 
         time.sleep(5)
 
     telegram_send(
-        """
+"""
 📡 PRE-OPEN SCANNING STARTED
 
 ⏰ 09:00–09:08 AM IST
@@ -1079,14 +916,21 @@ def main():
 🔒 BOSS FILTER LOCKED
 👥 BUYER PRIORITY ACTIVE
 🏦 QUALITY RANKING ACTIVE
+🛡️ RISK PROTECTION ACTIVE
 """
     )
 
+    sent_symbols = set()
+
+    latest_candidates = []
+
+    # --------------------------------------------------------
+    # SCAN LOOP
+    # --------------------------------------------------------
+
     while True:
 
-        now = now_ist()
-
-        # Stop after 09:08
+        now = datetime.now(IST)
 
         if (
             now.hour > 9
@@ -1095,105 +939,135 @@ def main():
                 and now.minute > 8
             )
         ):
-
             break
 
-        result = scan_once()
+        records = get_nse_data()
 
-        selected = result[
-            "selected"
-        ]
+        print(
+            f"{now.strftime('%H:%M:%S')} "
+            f"NSE Records: {len(records)}"
+        )
+
+        candidates = process_records(
+            records
+        )
+
+        print(
+            "BOSS Matches:",
+            len(candidates)
+        )
+
+        selected = select_gems(
+            candidates
+        )
+
+        latest_candidates = selected
+
+        # ----------------------------------------------------
+        # Send only new symbols
+        # ----------------------------------------------------
 
         for item in selected:
 
-            symbol = item[
-                "symbol"
-            ]
-
-            # Send each symbol only once
+            symbol = item["symbol"]
 
             if symbol not in sent_symbols:
 
-                send_gem_message(
-                    item,
-                    result["fallback"]
-                )
+                rank = len(sent_symbols) + 1
 
-                sent_symbols.add(
-                    symbol
-                )
+                if rank <= MAX_GEMS:
+
+                    send_gem(
+                        item,
+                        rank
+                    )
+
+                    sent_symbols.add(
+                        symbol
+                    )
 
         time.sleep(
             SCAN_INTERVAL
         )
 
-    # ========================================================
-    # FINAL REPORT
-    # ========================================================
+    # --------------------------------------------------------
+    # FINAL
+    # --------------------------------------------------------
 
-    result = scan_once()
+    final_records = get_nse_data()
 
-    selected = result[
-        "selected"
-    ]
+    final_candidates = process_records(
+        final_records
+    )
 
-    final_message = f"""
+    final_selected = select_gems(
+        final_candidates
+    )
+
+    message = f"""
 🏁 PREOPEN GEMS OFFICIAL
 
 📊 FINAL PRE-OPEN REPORT
 
-⏰ {now_ist().strftime('%H:%M:%S')} AM IST
+⏰ {datetime.now(IST).strftime('%H:%M:%S')} IST
 
-📊 NSE Records      : {result['records']}
-🔒 BOSS Matches     : {len(result['boss'])}
-💎 Selected Gems    : {len(selected)}
+📊 NSE Records   : {len(final_records)}
+🔒 BOSS Matches  : {len(final_candidates)}
+💎 Selected Gems : {len(final_selected)}
 
-👥 Buyer Priority   : 70%
-🏦 Quality Priority : 30%
+━━━━━━━━━━━━━━━━━━
 
-🎯 Maximum Output   : {MAX_GEMS}
+👥 Buyer Priority : HIGH
+🏦 Quality Score   : ACTIVE
+🛡️ Risk Protection: ACTIVE
+
+🎯 Maximum Output : {MAX_GEMS}
 
 """
 
-    if selected:
+    if final_selected:
 
-        final_message += (
-            "\n🏆 SELECTED STOCKS:\n\n"
-        )
+        message += "\n🏆 FINAL SELECTED:\n\n"
 
         for i, item in enumerate(
-            selected,
+            final_selected,
             1
         ):
 
-            final_message += (
+            message += (
                 f"{i}. {item['symbol']} "
                 f"• B/S {item['ratio']:.2f}x "
-                f"• Buy {item['buy_qty']:,.0f} "
-                f"• Quality {item['quality']}/7\n"
+                f"• Buy {int(item['buy_qty']):,} "
+                f"• Q {item['quality_score']}/7 "
+                f"• Score {item['final_score']:.1f}\n"
             )
 
     else:
 
-        final_message += (
-            "\n⚠️ No suitable GEM found today.\n"
+        message += (
+            "\n⚠️ No BOSS candidate found.\n"
         )
 
-    final_message += (
-        "\n🔒 BOSS FILTER WAS NOT CHANGED.\n"
-        "👥 Buyer strength was given highest priority.\n"
-        "\n💻 Made by Prakash Kanki"
-    )
+    message += """
+    
+━━━━━━━━━━━━━━━━━━
 
-    telegram_send(
-        final_message
-    )
+🔒 BOSS FILTER WAS NOT CHANGED.
+👥 Strong buyers remain the priority.
+🏦 Quality is supportive, not 7/7 mandatory.
+🛡️ Penny/low-quality stocks receive penalties.
 
-    print(
-        "SCAN FINISHED"
-    )
+💻 Made by Prakash Kanki
+"""
 
+    telegram_send(message)
+
+    print("PREOPEN SCAN FINISHED")
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-
     main()
