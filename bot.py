@@ -633,4 +633,4 @@ intra_BASELINE_MIN_SAMPLES = 3     # kam se kam itne poll ke baad hi surge check
 # ---------------- SURGE THRESHOLDS ----------------
 intra_VOLUME_SURGE_RATIO = 3.0     # is interval ka volume >= 3x average interval volume
 intra_PRICE_MIN_MOVE = 0.5         # kam se kam 0.5% up move (surge)
-intra_BUYER_MIN_RAT
+intra_BUYER_MIN_RATIO = 1.5
