@@ -15,6 +15,32 @@ import requests
 import yfinance as yf
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+# ============================================================
+# KEEP-ALIVE WEB SERVER
+# Railway free/trial plan sirf "web" service ko traffic milne par
+# active rakhta hai. Ye chhota server ek URL deta hai jisko bahar
+# se (UptimeRobot / cron-job.org) har 5 min ping karke bot ko
+# sone se rokte hain.
+# ============================================================
+class _PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive")
+
+    def log_message(self, format, *args):
+        pass  # server ke access logs se console spam na ho
+
+
+def _start_keepalive_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _PingHandler)
+    print(f"Keep-alive server listening on port {port}", flush=True)
+    server.serve_forever()
 
 
 # ============================================================
@@ -389,7 +415,7 @@ def pre_is_penny(item):
 
 
 def pre_select_gems(candidates):
-    """Min 1, Max pre_MAX_GEMS. Circuit/penny hatate hain, par 0 kabhi nahi."""
+    """Min 1, Max MAX_GEMS. Circuit/penny hatate hain, par 0 kabhi nahi."""
     if not candidates:
         return []
 
@@ -516,7 +542,7 @@ def pre_startup_message():
         "✅ Bot is online\n✅ Telegram connected\n✅ NSE scanner ready\n\n"
         "🔒 BOSS FILTER LOCKED\n👥 Buyer Priority ACTIVE\n"
         "🏦 Quality Ranking ACTIVE\n🛡️ Risk + Circuit + Penny Protection ACTIVE\n\n"
-        "⏰ Scan: 09:00–09:08 AM pre_IST\n📨 Final list: 09:10 AM pre_IST\n"
+        "⏰ Scan: 09:00–09:08 AM IST\n📨 Final list: 09:10 AM IST\n"
         "📊 Output: 1–10 stocks\n\n💻 Made by Prakash Kanki"
     )
 
@@ -534,7 +560,7 @@ def pre_wait_until(hour, minute):
 
 def pre_run_today():
     pre_wait_until(9, 0)
-    pre_telegram_send("📡 PRE-OPEN SCANNING STARTED\n⏰ 09:00–09:08 AM pre_IST\n🔄 Every 30 seconds")
+    pre_telegram_send("📡 PRE-OPEN SCANNING STARTED\n⏰ 09:00–09:08 AM IST\n🔄 Every 30 seconds")
 
     latest = []
     got_any_data = False
@@ -606,421 +632,11 @@ def pre_main():
 
 # ============================================================
 # INTRADAY MID+SMALLCAP VOLUME/BUYER SURGE SCANNER
-# Market hours: 09:15 - 15:30 intra_IST
+# Market hours: 09:15 - 15:30 IST
 # Universe: NIFTY MIDCAP 150 + NIFTY SMALLCAP 250
 # Alerts: sudden volume surge + sudden buyer surge, max 10/day
 # ============================================================
 
 intra_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 intra__raw_ids = os.getenv("TELEGRAM_CHAT_ID", "7418177111,1391074551")
-intra_TELEGRAM_CHAT_IDS = [x.strip() for x in intra__raw_ids.replace(";", ",").split(",") if x.strip()]
-
-intra_IST = ZoneInfo("Asia/Kolkata")
-
-intra_NSE_HOME = "https://www.nseindia.com/"
-intra_NSE_INDEX_URL = "https://www.nseindia.com/api/equity-stockIndices?index={idx}"
-intra_NSE_QUOTE_URL = "https://www.nseindia.com/api/quote-equity?symbol={sym}"
-
-intra_INDEXES = ["NIFTY MIDCAP 150", "NIFTY SMALLCAP 250"]
-
-# ---------------- TIMING ----------------
-intra_MARKET_START = (9, 15)
-intra_WARMUP_UNTIL = (9, 30)      # pehle 15 min sirf data collect, alert nahi (volume abhi settle nahi hua)
-intra_MARKET_END = (15, 30)
-intra_POLL_INTERVAL_SEC = 180      # har 3 min data lo
-intra_BASELINE_MIN_SAMPLES = 3     # kam se kam itne poll ke baad hi surge check
-
-# ---------------- SURGE THRESHOLDS ----------------
-intra_VOLUME_SURGE_RATIO = 3.0     # is interval ka volume >= 3x average interval volume
-intra_PRICE_MIN_MOVE = 0.5         # kam se kam 0.5% up move (surge)
-intra_BUYER_MIN_RATIO = 1.5        # order-book buy/sell >= 1.5x (sirf top candidates ke liye check hoga)
-
-# ---------------- SAFETY / QUALITY ----------------
-intra_MIN_PRICE = 50
-intra_CIRCUIT_BUFFER = 0.8         # band ka 80%+ = circuit ke paas, skip
-intra_MAX_ALERTS_PER_DAY = 10
-intra_MIN_ALERT_SCORE = 40         # loose ho sakta hai agar din bhar me kam mile
-
-# fundamentals (loose but not junk)
-intra_MAX_PE = 100
-intra_MIN_ROE = 0.0                # sirf negative ROE reject
-intra_MAX_DE = 2.5                 # debt/equity
-intra_MIN_MCAP_CR = 500
-
-# ============================================================
-# SESSION
-# ============================================================
-intra_session = requests.Session()
-intra_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/140.0.0.0 Safari/537.36"),
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": intra_NSE_HOME,
-    "Connection": "keep-alive",
-}
-
-intra_fundamental_cache = {}
-intra_band_cache = {}
-intra_history = {}          # symbol -> list of (timestamp, cum_volume, price, pchange)
-intra_alerted_today = set()
-intra_alert_count_today = 0
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-def intra_telegram_send(message):
-    if not intra_TELEGRAM_BOT_TOKEN or not intra_TELEGRAM_CHAT_IDS:
-        print("Telegram credentials missing")
-        return
-    url = f"https://api.telegram.org/bot{intra_TELEGRAM_BOT_TOKEN}/sendMessage"
-    for chat_id in intra_TELEGRAM_CHAT_IDS:
-        try:
-            r = intra_session.post(url, data={"chat_id": chat_id, "text": message,
-                                        "disable_web_page_preview": True}, timeout=15)
-            if r.status_code != 200:
-                print(f"Telegram error [{chat_id}]:", r.status_code, r.text[:300])
-        except Exception as e:
-            print(f"Telegram exception [{chat_id}]:", e)
-        time.sleep(0.3)
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-def intra_num(v, default=0.0):
-    try:
-        if v is None:
-            return default
-        if isinstance(v, str):
-            v = v.replace(",", "").strip()
-            if v in ("", "-", "N/A", "NA", "None"):
-                return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def intra_refresh_cookies():
-    try:
-        intra_session.get(intra_NSE_HOME, headers=intra_HEADERS, timeout=10)
-    except Exception:
-        pass
-
-
-# ============================================================
-# NSE: INDEX LIVE DATA (ek call me poore index ka data)
-# ============================================================
-def intra_get_index_data(index_name):
-    try:
-        url = intra_NSE_INDEX_URL.format(idx=requests.utils.quote(index_name))
-        r = intra_session.get(url, headers=intra_HEADERS, timeout=15)
-        if r.status_code != 200:
-            print("NSE index HTTP:", index_name, r.status_code)
-            return []
-        data = r.json().get("data", [])
-        # pehli entry index summary hoti hai (symbol == index name), usko hata do
-        return [d for d in data if d.get("symbol") and d.get("series") == "EQ"]
-    except Exception as e:
-        print("NSE index error:", index_name, e)
-        return []
-
-
-def intra_get_universe():
-    intra_refresh_cookies()
-    combined = {}
-    for idx in intra_INDEXES:
-        for d in intra_get_index_data(idx):
-            combined[d["symbol"]] = d  # dedupe agar dono index me ho
-    return combined
-
-
-# ============================================================
-# NSE: PER-SYMBOL QUOTE (buy/sell qty + band) - sirf top candidates ke liye
-# ============================================================
-def intra_get_quote_detail(symbol):
-    try:
-        r = intra_session.get(intra_NSE_QUOTE_URL.format(sym=symbol), headers=intra_HEADERS, timeout=12)
-        j = r.json()
-        depth = j.get("marketDeptOrderBook", {})
-        buy_qty = intra_num(depth.get("totalBuyQuantity"))
-        sell_qty = intra_num(depth.get("totalSellQuantity"))
-        band = j.get("priceInfo", {}).get("pPriceBand", "")
-        band = float(band) if str(band).replace(".", "").isdigit() else None
-        return buy_qty, sell_qty, band
-    except Exception as e:
-        print("Quote error:", symbol, e)
-        return 0, 0, None
-
-
-# ============================================================
-# FUNDAMENTALS
-# ============================================================
-def intra_get_fundamentals(symbol):
-    if symbol in intra_fundamental_cache:
-        return intra_fundamental_cache[symbol]
-    result = {"market_cap": None, "pe": None, "roe": None, "de": None}
-    try:
-        info = yf.Ticker(symbol + ".NS").info
-        mc = info.get("marketCap")
-        if mc:
-            result["market_cap"] = mc / 10000000
-        result["pe"] = info.get("trailingPE")
-        roe = info.get("returnOnEquity")
-        result["roe"] = roe if roe is not None else None
-        de = info.get("debtToEquity")
-        if de is not None:
-            result["de"] = de / 100 if de > 20 else de
-    except Exception as e:
-        print("Fundamental error", symbol, e)
-    intra_fundamental_cache[symbol] = result
-    return result
-
-
-def intra_fundamentals_ok(f):
-    if f["market_cap"] is not None and f["market_cap"] < intra_MIN_MCAP_CR:
-        return False
-    if f["pe"] is not None and (f["pe"] < 0 or f["pe"] > intra_MAX_PE):
-        return False
-    if f["roe"] is not None and f["roe"] < intra_MIN_ROE:
-        return False
-    if f["de"] is not None and f["de"] > intra_MAX_DE:
-        return False
-    return True
-
-
-# ============================================================
-# SURGE DETECTION
-# ============================================================
-def intra_update_history_and_detect(universe, now):
-    """Har poll par intra_history update karo, surge candidates return karo."""
-    candidates = []
-
-    for symbol, d in universe.items():
-        price = intra_num(d.get("lastPrice"))
-        pchange = intra_num(d.get("pChange"))
-        cum_vol = intra_num(d.get("totalTradedVolume"))
-
-        if price <= 0:
-            continue
-
-        hist = intra_history.setdefault(symbol, [])
-        hist.append((now, cum_vol, price, pchange))
-        if len(hist) > 30:
-            del hist[0]
-
-        if len(hist) < intra_BASELINE_MIN_SAMPLES + 1:
-            continue  # abhi baseline banane ke liye kaafi data nahi
-
-        # is interval ka volume
-        interval_vol = cum_vol - hist[-2][1]
-        if interval_vol <= 0:
-            continue
-
-        # baseline = purane intervals ka average (current chhodkar)
-        deltas = [hist[i][1] - hist[i - 1][1] for i in range(1, len(hist) - 1)]
-        deltas = [x for x in deltas if x > 0]
-        if not deltas:
-            continue
-        baseline = sum(deltas) / len(deltas)
-        if baseline <= 0:
-            continue
-
-        surge_ratio = interval_vol / baseline
-
-        if surge_ratio >= intra_VOLUME_SURGE_RATIO and pchange >= intra_PRICE_MIN_MOVE:
-            candidates.append({
-                "symbol": symbol, "price": price, "pchange": pchange,
-                "surge_ratio": surge_ratio, "cum_vol": cum_vol,
-            })
-
-    return candidates
-
-
-# ============================================================
-# SCORING
-# ============================================================
-def intra_score_candidate(c, buy_qty, sell_qty, f):
-    ratio = (buy_qty / sell_qty) if sell_qty > 0 else 0
-    ratio_score = min(100, (ratio / 3.5) * 100) if ratio else 0
-    vol_score = min(100, (c["surge_ratio"] / 8) * 100)
-    price_score = min(100, c["pchange"] * 8)
-
-    quality = 0
-    if f["market_cap"] and f["market_cap"] >= 2000:
-        quality += 30
-    elif f["market_cap"] and f["market_cap"] >= 1000:
-        quality += 20
-    elif f["market_cap"] and f["market_cap"] >= 500:
-        quality += 10
-    if f["roe"] is not None and f["roe"] >= 0.12:
-        quality += 20
-    if f["de"] is not None and f["de"] <= 0.7:
-        quality += 15
-    if f["pe"] is not None and 0 < f["pe"] <= 40:
-        quality += 15
-    quality = min(100, quality)
-
-    final = ratio_score * 0.35 + vol_score * 0.30 + price_score * 0.10 + quality * 0.25
-    return round(final, 2), round(ratio, 2)
-
-
-# ============================================================
-# ALERT
-# ============================================================
-def intra_send_alert(c, buy_qty, sell_qty, ratio, f, band, score):
-    de_txt = f"{f['de']:.2f}" if f["de"] is not None else "N/A"
-    roe_txt = f"{f['roe']*100:.1f}%" if f["roe"] is not None else "N/A"
-    pe_txt = f"{f['pe']:.1f}" if f["pe"] is not None else "N/A"
-    mcap_txt = f"₹{f['market_cap']:,.0f} Cr" if f["market_cap"] is not None else "N/A"
-
-    msg = f"""
-🚨 INTRADAY SURGE ALERT
-
-📌 {c['symbol']}   ₹{c['price']:.2f}  ({c['pchange']:+.2f}%)
-🕐 {datetime.now(intra_IST).strftime('%H:%M')} intra_IST
-
-━━━━━━━━━━━━━━━━━━
-📊 VOLUME + BUYERS
-━━━━━━━━━━━━━━━━━━
-🔥 Volume Surge : {c['surge_ratio']:.1f}x normal
-⚖️ Buy:Sell     : {ratio:.1f}x
-🟢 Buy Qty      : {int(buy_qty):,}
-🔴 Sell Qty     : {int(sell_qty):,}
-
-━━━━━━━━━━━━━━━━━━
-🏦 FUNDAMENTALS
-━━━━━━━━━━━━━━━━━━
-💰 Market Cap : {mcap_txt}
-ROE           : {roe_txt}
-D/E           : {de_txt}
-PE            : {pe_txt}
-
-🏆 SCORE : {score}/100
-
-⚠️ Sirf screening hai, advice nahi. Apna analysis aur stoploss zaroor rakhein.
-"""
-    intra_telegram_send(msg)
-
-
-# ============================================================
-# MAIN LOOP (one trading day)
-# ============================================================
-def intra_in_market_hours(now):
-    return (intra_MARKET_START <= (now.hour, now.minute) <= intra_MARKET_END)
-
-
-def intra_past_warmup(now):
-    return (now.hour, now.minute) >= intra_WARMUP_UNTIL
-
-
-def intra_run_day():
-    global intra_alert_count_today
-    intra_history.clear()
-    intra_alerted_today.clear()
-    intra_alert_count_today = 0
-
-    intra_telegram_send("📡 Intraday Mid+Smallcap Scanner shuru\n"
-                  "⏰ 09:15 - 15:30 intra_IST | Poll: 3 min\n"
-                  "🎯 Universe: Nifty Midcap 150 + Smallcap 250")
-
-    while True:
-        now = datetime.now(intra_IST)
-        if (now.hour, now.minute) > intra_MARKET_END:
-            break
-        if (now.hour, now.minute) < intra_MARKET_START:
-            time.sleep(10)
-            continue
-
-        universe = intra_get_universe()
-        if not universe:
-            time.sleep(intra_POLL_INTERVAL_SEC)
-            continue
-
-        candidates = intra_update_history_and_detect(universe, now)
-
-        if intra_past_warmup(now) and candidates and intra_alert_count_today < intra_MAX_ALERTS_PER_DAY:
-            # sabse zyada surge wale pehle
-            candidates.sort(key=lambda x: x["surge_ratio"], reverse=True)
-
-            for c in candidates:
-                if intra_alert_count_today >= intra_MAX_ALERTS_PER_DAY:
-                    break
-                if c["symbol"] in intra_alerted_today:
-                    continue
-                if c["price"] < intra_MIN_PRICE:
-                    continue
-
-                buy_qty, sell_qty, band = intra_get_quote_detail(c["symbol"])
-                if band and c["pchange"] >= band * intra_CIRCUIT_BUFFER:
-                    continue  # circuit ke paas
-                if sell_qty <= 0 or (buy_qty / sell_qty) < intra_BUYER_MIN_RATIO:
-                    continue
-
-                f = intra_get_fundamentals(c["symbol"])
-                if not intra_fundamentals_ok(f):
-                    continue
-
-                score, ratio = intra_score_candidate(c, buy_qty, sell_qty, f)
-                if score < intra_MIN_ALERT_SCORE:
-                    continue
-
-                intra_send_alert(c, buy_qty, sell_qty, ratio, f, band, score)
-                intra_alerted_today.add(c["symbol"])
-                intra_alert_count_today += 1
-                time.sleep(0.5)
-
-        time.sleep(intra_POLL_INTERVAL_SEC)
-
-    if intra_alert_count_today == 0:
-        intra_telegram_send("📭 Aaj koi bhi stock volume+buyer surge criteria par match nahi hua.")
-    else:
-        intra_telegram_send(f"✅ Market band. Aaj total {intra_alert_count_today} alerts bheje gaye.")
-
-
-# ============================================================
-# ENTRY POINT (roz chalega)
-# ============================================================
-def intra_main():
-    intra_telegram_send("🤖 Bot online (Railway par start hua). Market hours me scan shuru hoga.")
-    last_run_date = None
-    while True:
-        now = datetime.now(intra_IST)
-        today = now.date()
-
-        if now.weekday() < 5 and last_run_date != today and (now.hour, now.minute) <= intra_MARKET_END:
-            last_run_date = today
-            try:
-                intra_run_day()
-            except Exception as e:
-                intra_telegram_send(f"⚠️ Scanner error: {e}")
-                print("run_day error:", e)
-            intra_fundamental_cache.clear()
-            intra_band_cache.clear()
-
-        time.sleep(20)
-
-
-
-
-# ============================================================
-# RUNNER: dono bots ek hi process me (alag threads)
-# ============================================================
-def _run_forever(name, fn):
-    while True:
-        try:
-            fn()
-        except Exception as e:
-            print(f"[{name}] crashed: {e}. Restart in 15s", flush=True)
-            time.sleep(15)
-
-
-if __name__ == "__main__":
-    t1 = threading.Thread(target=_run_forever, args=("PREOPEN", pre_main), daemon=True)
-    t2 = threading.Thread(target=_run_forever, args=("INTRADAY", intra_main), daemon=True)
-    t1.start()
-    t2.start()
-    while True:
-        time.sleep(60)
+intra_TELEGRAM_CHAT_IDS = [x.st
