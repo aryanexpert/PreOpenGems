@@ -639,4 +639,4 @@ def pre_main():
 
 intra_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 intra__raw_ids = os.getenv("TELEGRAM_CHAT_ID", "7418177111,1391074551")
-intra_TELEGRAM_CHAT_IDS = [x.st
+intra_TELEGRAM_CHAT_IDS = [x.strip() for x in intra__raw_ids.replace(";", ",").split(",") if x.strip()]
