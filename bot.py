@@ -1,642 +1,626 @@
-"""
-PREOPEN GEMS + INTRADAY MID/SMALLCAP SURGE  -  ALL-IN-ONE BOT
-Start command:  python bot.py
+PREOPEN GEMS + INTRADAY SURGE BOT  (v4 - self-scheduling)
 
-Railway variables:
-  TELEGRAM_BOT_TOKEN = <bot token>
-  TELEGRAM_CHAT_ID   = 7418177111,1391074551
-requirements.txt:  requests, yfinance
+Run:      python bot.py
+Needs:    pip install requests yfinance
+Env vars: TELEGRAM_BOT_TOKEN = <bot token>
+          TELEGRAM_CHAT_ID   = 7418177111,1391074551
+
+Koi cron / Railway / hosting service nahi chahiye.
+Script khud IST clock dekhkar 09:00 pre-open aur 09:15-15:30 intraday chalati hai.
+Wall-clock based hai: laptop/phone sleep se wake ho ya bot restart ho, wapas sync ho jata hai.
 """
 import os
+import sys
 import time
 import math
-import threading
+import json
+import logging
+from datetime import datetime
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
 import requests
 import yfinance as yf
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# ============================================================
+# CONFIG
+# ============================================================
+IST = ZoneInfo("Asia/Kolkata")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_IDS = [x.strip() for x in
+            os.getenv("TELEGRAM_CHAT_ID", "7418177111,1391074551").replace(";", ",").split(",")
+            if x.strip()]
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
+
+# ---- Pre-open ----
+SCAN_INTERVAL = 30
+BOSS_MIN_CHANGE = 2.0
+BOSS_MIN_RATIO = 3.0
+BOSS_MIN_BUY_QTY = 50000
+BOSS_SERIES = "EQ"
+MIN_GEMS, MAX_GEMS, MIN_FINAL_SCORE = 1, 10, 35
+HARD_MIN_PRICE = 50
+CIRCUIT_BUFFER = 0.8
+LOW_PRICE, VERY_LOW_PRICE = 50, 20
+
+# ---- Intraday ----
+INDEXES = ["NIFTY MIDCAP 150", "NIFTY SMALLCAP 250"]
+POLL_SEC = 180
+WARMUP_UNTIL = (9, 30)
+MARKET_END = (15, 30)
+MIN_SAMPLES = 3                # itne intervals ke baad hi surge check
+VOL_RATIO = 3.0                # interval volume >= 3x recent average
+PRICE_MIN_MOVE = 0.5           # day change >= +0.5%
+BUYER_MIN_RATIO = 1.5          # buy qty / sell qty
+MIN_INTERVAL_VALUE = 2_000_000  # interval turnover >= 20 lakh (noise filter)
+MAX_ALERTS = 10
+
+NSE_HOME = "https://www.nseindia.com/"
+PRE_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+QUOTE_URL = "https://www.nseindia.com/api/quote-equity?symbol="
+INDEX_URL = "https://www.nseindia.com/api/equity-stockIndices?index="
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
+                    datefmt="%H:%M:%S", stream=sys.stdout)
+log = logging.info
 
 
 # ============================================================
-# KEEP-ALIVE WEB SERVER
-# Railway free/trial plan sirf "web" service ko traffic milne par
-# active rakhta hai. Ye chhota server ek URL deta hai jisko bahar
-# se (UptimeRobot / cron-job.org) har 5 min ping karke bot ko
-# sone se rokte hain.
+# TIME + STATE
 # ============================================================
-class _PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-    def log_message(self, format, *args):
-        pass  # server ke access logs se console spam na ho
+def now():
+    return datetime.now(IST)
 
 
-def _start_keepalive_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), _PingHandler)
-    print(f"Keep-alive server listening on port {port}", flush=True)
-    server.serve_forever()
+def hm():
+    n = now()
+    return (n.hour, n.minute)
 
 
-# ============================================================
-# PART 1: PRE-OPEN (9:00-9:10)
-# ============================================================
+def wait_until(h, m):
+    while hm() < (h, m):
+        time.sleep(2)
 
-# ============================================================
-# PREOPEN GEMS OFFICIAL  (v3)
-# BOSS + BUYER PRIORITY + QUALITY + RISK + CIRCUIT/PENNY SAFETY
-# Multi chat-id support
-# ============================================================
 
-pre_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-# Comma separated: 7418177111,1391074551
-pre__raw_ids = os.getenv("TELEGRAM_CHAT_ID", "7418177111,1391074551")
-pre_TELEGRAM_CHAT_IDS = [x.strip() for x in pre__raw_ids.replace(";", ",").split(",") if x.strip()]
 
-pre_NSE_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
-pre_NSE_HOME = "https://www.nseindia.com/"
-pre_NSE_QUOTE = "https://www.nseindia.com/api/quote-equity?symbol="
-
-pre_IST = ZoneInfo("Asia/Kolkata")
-pre_SCAN_INTERVAL = 30
-
-# ---------------- BOSS FILTER (LOCKED) ----------------
-pre_BOSS_MIN_CHANGE = 2.0
-pre_BOSS_MIN_RATIO = 3.0
-pre_BOSS_MIN_BUY_QTY = 50000
-pre_BOSS_SERIES = "EQ"
-
-# ---------------- OUTPUT ----------------
-pre_MIN_GEMS = 1
-pre_MAX_GEMS = 10
-pre_MIN_FINAL_SCORE = 35
-
-# ---------------- SAFETY (naya) ----------------
-pre_HARD_MIN_PRICE = 50          # isse niche = penny, final list se hata denge
-pre_CIRCUIT_BUFFER = 0.8         # band ka 80% se upar = circuit ke paas
-FINAL_SEND_HOUR, FINAL_SEND_MIN = 9, 10   # final list 9:10 par
-
-# ---------------- QUALITY / RISK ----------------
-pre_LOW_PRICE = 50
-pre_VERY_LOW_PRICE = 20
-
-pre_nse_session = requests.Session()
-pre_nse_headers = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/140.0.0.0 Safari/537.36"),
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": pre_NSE_HOME,
-    "Connection": "keep-alive",
-}
-
-pre_fundamental_cache = {}
-pre_band_cache = {}
+def save_state(state):
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log(f"state save error: {e}")
 
 
 # ============================================================
-# TELEGRAM  (sabhi chat IDs par bhejta hai)
+# TELEGRAM (retry + rate-limit safe)
 # ============================================================
-def pre_telegram_send(message):
-    if not pre_TELEGRAM_BOT_TOKEN or not pre_TELEGRAM_CHAT_IDS:
-        print("Telegram credentials missing")
+def tg(text):
+    if not TOKEN or not CHAT_IDS:
+        log("Telegram credentials missing")
         return False
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    ok = False
+    for i in range(0, len(text), 4000):
+        chunk = text[i:i + 4000]
+        for cid in CHAT_IDS:
+            for _ in range(3):
+                try:
+                    r = requests.post(url, data={"chat_id": cid, "text": chunk,
+                                                 "disable_web_page_preview": True}, timeout=15)
+                    if r.status_code == 200:
+                        ok = True
+                        break
+                    if r.status_code == 429:
+                        wait = r.json().get("parameters", {}).get("retry_after", 3)
+                        time.sleep(wait + 1)
+                        continue
+                    log(f"Telegram [{cid}] {r.status_code} {r.text[:200]}")
+                    break
+                except Exception as e:
+                    log(f"Telegram [{cid}] exception: {e}")
+                    time.sleep(2)
+            time.sleep(0.3)
+    return ok
 
-    url = f"https://api.telegram.org/bot{pre_TELEGRAM_BOT_TOKEN}/sendMessage"
-    ok_any = False
 
-    for chat_id in pre_TELEGRAM_CHAT_IDS:
+_last_err = 0
+
+
+def notify_error(e):
+    global _last_err
+    log(f"ERROR: {e!r}")
+    if time.time() - _last_err > 600:      # max 1 error msg / 10 min
+        _last_err = time.time()
+        tg(f"⚠️ Bot error (auto-recovering): {e}")
+
+
+# ============================================================
+# NSE CLIENT (cookie refresh + retry)
+# ============================================================
+class NSE:
+    HEADERS = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_HOME,
+        "Connection": "keep-alive",
+    }
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.warm_at = 0
+
+    def warm(self):
         try:
-            r = requests.post(
-                url,
-                data={"chat_id": chat_id, "text": message,
-                      "disable_web_page_preview": True},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                ok_any = True
-            else:
-                print(f"Telegram error [{chat_id}]:", r.status_code, r.text[:300])
+            self.s.get(NSE_HOME, headers=self.HEADERS, timeout=10)
         except Exception as e:
-            print(f"Telegram exception [{chat_id}]:", e)
-        time.sleep(0.3)
+            log(f"NSE warm error: {e}")
+        self.warm_at = time.time()
 
-    return ok_any
+    def get(self, url, tries=3):
+        if time.time() - self.warm_at > 240:
+            self.warm()
+        for i in range(tries):
+            try:
+                r = self.s.get(url, headers=self.HEADERS, timeout=15)
+                if r.status_code == 200:
+                    return r.json()
+                log(f"NSE HTTP {r.status_code}")
+                if r.status_code in (401, 403):
+                    self.s.cookies.clear()
+                    self.warm()
+            except Exception as e:
+                log(f"NSE error: {e}")
+            time.sleep(2 * (i + 1))
+        return None
+
+
+nse = NSE()
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-def pre_num(value, default=0):
+def num(v, default=0.0):
     try:
-        if value is None:
+        if v is None:
             return default
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-            if value in ("", "-", "N/A", "NA", "None"):
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+            if v in ("", "-", "N/A", "NA", "None"):
                 return default
-        return float(value)
+        return float(v)
     except Exception:
         return default
 
 
-def pre_clean(value):
+def clean(v):
     try:
-        if value is None:
+        if v is None:
             return None
-        value = float(value)
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
+        v = float(v)
+        return None if (math.isnan(v) or math.isinf(v)) else v
     except Exception:
         return None
 
 
 # ============================================================
-# NSE
+# PART 1: PRE-OPEN
 # ============================================================
-def pre_get_nse_data():
+fund_cache, band_cache = {}, {}
+
+
+def get_fundamentals(sym):
+    if sym in fund_cache:
+        return fund_cache[sym]
+    res = {"market_cap": None, "roe": None, "roce": None, "de": None,
+           "sales_growth": None, "profit_growth": None, "pledge": None, "price": None}
     try:
-        try:
-            pre_nse_session.get(pre_NSE_HOME, headers=pre_nse_headers, timeout=10)
-        except Exception:
-            pass
-        r = pre_nse_session.get(pre_NSE_URL, headers=pre_nse_headers, timeout=15)
-        if r.status_code != 200:
-            print("NSE HTTP:", r.status_code)
-            return []
-        data = r.json()
-        if isinstance(data, dict):
-            return data.get("data", [])
-        return data
+        info = yf.Ticker(sym + ".NS").info
+        mc = clean(info.get("marketCap"))
+        if mc is not None:
+            res["market_cap"] = mc / 1e7
+        p = clean(info.get("currentPrice"))
+        res["price"] = p if p is not None else clean(info.get("regularMarketPrice"))
+        roe = clean(info.get("returnOnEquity"))
+        if roe is not None:
+            res["roe"] = roe * 100
+        roce = clean(info.get("returnOnCapitalEmployed"))
+        if roce is not None:
+            res["roce"] = roce * 100 if roce < 1 else roce
+        de = clean(info.get("debtToEquity"))
+        if de is not None:
+            res["de"] = de / 100 if de > 20 else de
+        sg = clean(info.get("revenueGrowth"))
+        if sg is not None:
+            res["sales_growth"] = sg * 100
+        pg = clean(info.get("earningsGrowth"))
+        if pg is not None:
+            res["profit_growth"] = pg * 100
+        pl = clean(info.get("pledgeRatio"))
+        if pl is not None:
+            res["pledge"] = pl * 100
     except Exception as e:
-        print("NSE error:", e)
-        return []
+        log(f"Fundamental error {sym}: {e}")
+    fund_cache[sym] = res
+    return res
 
 
-def pre_get_price_band(symbol):
-    """Price band % (None = no band / unknown)."""
-    if symbol in pre_band_cache:
-        return pre_band_cache[symbol]
+def price_band(sym):
+    if sym in band_cache:
+        return band_cache[sym]
     band = None
+    d = nse.get(QUOTE_URL + sym, tries=1)
     try:
-        r = pre_nse_session.get(pre_NSE_QUOTE + symbol, headers=pre_nse_headers, timeout=12)
-        b = str(r.json().get("priceInfo", {}).get("pPriceBand", "")).strip()
+        b = str(d["priceInfo"]["pPriceBand"]).strip()
         if b.replace(".", "").isdigit():
             band = float(b)
     except Exception:
         pass
-    pre_band_cache[symbol] = band
+    band_cache[sym] = band
     time.sleep(0.3)
     return band
 
 
-# ============================================================
-# FUNDAMENTALS
-# ============================================================
-def pre_get_fundamentals(symbol):
-    if symbol in pre_fundamental_cache:
-        return pre_fundamental_cache[symbol]
+def preopen_records():
+    d = nse.get(PRE_URL)
+    if not d:
+        return []
+    return d.get("data", []) if isinstance(d, dict) else d
 
-    result = {"market_cap": None, "roe": None, "roce": None, "de": None,
-              "sales_growth": None, "profit_growth": None,
-              "pledge": None, "price": None}
+
+def boss_filter(rec):
     try:
-        info = yf.Ticker(symbol + ".NS").info
-
-        mc = pre_clean(info.get("marketCap"))
-        if mc is not None:
-            result["market_cap"] = mc / 10000000
-
-        price = pre_clean(info.get("currentPrice"))
-        if price is None:
-            price = pre_clean(info.get("regularMarketPrice"))
-        result["price"] = price
-
-        roe = pre_clean(info.get("returnOnEquity"))
-        if roe is not None:
-            result["roe"] = roe * 100
-
-        roce = pre_clean(info.get("returnOnCapitalEmployed"))
-        if roce is not None:
-            result["roce"] = roce * 100 if roce < 1 else roce
-
-        de = pre_clean(info.get("debtToEquity"))
-        if de is not None:
-            result["de"] = de / 100 if de > 20 else de
-
-        sales = pre_clean(info.get("revenueGrowth"))
-        if sales is not None:
-            result["sales_growth"] = sales * 100
-
-        profit = pre_clean(info.get("earningsGrowth"))
-        if profit is not None:
-            result["profit_growth"] = profit * 100
-
-        pledge = pre_clean(info.get("pledgeRatio"))
-        if pledge is not None:
-            result["pledge"] = pledge * 100
-    except Exception as e:
-        print(f"Fundamental error {symbol}: {e}")
-
-    pre_fundamental_cache[symbol] = result
-    return result
-
-
-# ============================================================
-# BOSS FILTER
-# ============================================================
-def pre_boss_filter(record):
-    try:
-        metadata = record.get("metadata", {})
-        detail = record.get("detail", {})
-        symbol = metadata.get("symbol")
-        series = metadata.get("series")
-        change = pre_num(metadata.get("pChange"))
-        iep = pre_num(metadata.get("iep"))
+        meta, detail = rec.get("metadata", {}), rec.get("detail", {})
+        sym, series = meta.get("symbol"), meta.get("series")
+        change, iep = num(meta.get("pChange")), num(meta.get("iep"))
         pre = detail.get("preOpenMarket", {})
-        buy_qty = pre_num(pre.get("totalBuyQuantity"))
-        sell_qty = pre_num(pre.get("totalSellQuantity"))
-
-        if not symbol:
+        buy, sell = num(pre.get("totalBuyQuantity")), num(pre.get("totalSellQuantity"))
+        if not sym or series != BOSS_SERIES:
             return None
-        if series != pre_BOSS_SERIES:
+        if change < BOSS_MIN_CHANGE or buy < BOSS_MIN_BUY_QTY or sell <= 0:
             return None
-        if change < pre_BOSS_MIN_CHANGE:
+        ratio = buy / sell
+        if ratio < BOSS_MIN_RATIO:
             return None
-        if buy_qty < pre_BOSS_MIN_BUY_QTY:
-            return None
-        if sell_qty <= 0:
-            return None
-        ratio = buy_qty / sell_qty
-        if ratio < pre_BOSS_MIN_RATIO:
-            return None
-
-        return {"symbol": symbol, "series": series, "change": change,
-                "iep": iep, "buy_qty": buy_qty, "sell_qty": sell_qty,
-                "ratio": ratio}
+        return {"symbol": sym, "change": change, "iep": iep,
+                "buy_qty": buy, "sell_qty": sell, "ratio": ratio}
     except Exception:
         return None
 
 
-# ============================================================
-# SCORES
-# ============================================================
-def pre_buyer_score(item):
-    ratio, buy_qty, change = item["ratio"], item["buy_qty"], item["change"]
+def boss_matches(records):
+    out = [x for x in (boss_filter(r) for r in records) if x]
+    for x in out:
+        x["buyer_score"] = buyer_score(x)
+    return out
 
+
+def buyer_score(it):
+    ratio, buy, change = it["ratio"], it["buy_qty"], it["change"]
     if ratio <= 3:
-        ratio_score = 25
+        rs = 25
     elif ratio >= 25:
-        ratio_score = 100
+        rs = 100
     else:
-        ratio_score = 25 + ((ratio - 3) / 22) * 75
-
-    if buy_qty <= 50000:
-        qty_score = 20
-    else:
-        qty_score = min(100, 20 + math.log10(buy_qty / 50000) * 45)
-
-    change_score = min(100, max(0, change * 4))
-
-    return round(ratio_score * 0.50 + qty_score * 0.30 + change_score * 0.20, 2)
+        rs = 25 + ((ratio - 3) / 22) * 75
+    qs = 20 if buy <= 50000 else min(100, 20 + math.log10(buy / 50000) * 45)
+    cs = min(100, max(0, change * 4))
+    return round(rs * 0.50 + qs * 0.30 + cs * 0.20, 2)
 
 
-def pre_quality_score(f):
-    score, reasons = 0, []
-
+def quality_score(f):
+    s = 0
     if f["market_cap"] is not None:
-        if f["market_cap"] >= 1000:
-            score += 2; reasons.append("Strong Market Cap")
-        elif f["market_cap"] >= 500:
-            score += 1; reasons.append("Market Cap")
-
-    if f["sales_growth"] is not None:
-        if f["sales_growth"] >= 10:
-            score += 1; reasons.append("Sales Growth")
-        elif f["sales_growth"] > 0:
-            score += 0.5
-
-    if f["profit_growth"] is not None:
-        if f["profit_growth"] >= 10:
-            score += 1; reasons.append("Profit Growth")
-        elif f["profit_growth"] > 0:
-            score += 0.5
-
+        s += 2 if f["market_cap"] >= 1000 else (1 if f["market_cap"] >= 500 else 0)
+    for k in ("sales_growth", "profit_growth"):
+        if f[k] is not None:
+            s += 1 if f[k] >= 10 else (0.5 if f[k] > 0 else 0)
     if f["roe"] is not None and f["roe"] >= 12:
-        score += 1; reasons.append("ROE")
-
+        s += 1
     if f["roce"] is not None and f["roce"] >= 15:
-        score += 1; reasons.append("ROCE")
-
+        s += 1
     if f["de"] is not None:
-        if f["de"] <= 0.50:
-            score += 1; reasons.append("Low D/E")
-        elif f["de"] <= 1.0:
-            score += 0.5
-
+        s += 1 if f["de"] <= 0.5 else (0.5 if f["de"] <= 1 else 0)
     if f["pledge"] is not None and f["pledge"] <= 5:
-        score += 1; reasons.append("Low Pledge")
+        s += 1
+    return round(s, 1)
 
-    return round(score, 1), reasons
 
-
-def pre_risk_penalty(f, iep=None):
-    penalty, reasons = 0, []
+def risk_penalty(f, iep):
+    p, reasons = 0, []
     mc = f["market_cap"]
     price = f["price"] if f["price"] is not None else iep
-
     if mc is not None:
         if mc < 100:
-            penalty += 25; reasons.append("Very Small Cap")
+            p += 25; reasons.append("Very Small Cap")
         elif mc < 250:
-            penalty += 15; reasons.append("Small Cap")
+            p += 15; reasons.append("Small Cap")
         elif mc < 500:
-            penalty += 7; reasons.append("Lower Market Cap")
-
+            p += 7; reasons.append("Lower Market Cap")
     if price is not None:
-        if price < pre_VERY_LOW_PRICE:
-            penalty += 20; reasons.append("Very Low Price")
-        elif price < pre_LOW_PRICE:
-            penalty += 8; reasons.append("Low Price")
-
+        if price < VERY_LOW_PRICE:
+            p += 20; reasons.append("Very Low Price")
+        elif price < LOW_PRICE:
+            p += 8; reasons.append("Low Price")
     if f["de"] is not None:
         if f["de"] > 3:
-            penalty += 15; reasons.append("High D/E")
+            p += 15; reasons.append("High D/E")
         elif f["de"] > 1:
-            penalty += 6; reasons.append("D/E > 1")
-
-    return penalty, reasons
-
-
-def pre_final_score(item):
-    bscore = pre_buyer_score(item)
-    f = item["fundamentals"]
-    qscore, qreasons = pre_quality_score(f)
-    penalty, preasons = pre_risk_penalty(f, item["iep"])
-    quality_norm = min(100, (qscore / 7) * 100)
-    final = bscore * 0.60 + quality_norm * 0.30 - penalty * 0.10
-    return {"buyer_score": round(bscore, 2), "quality_score": qscore,
-            "quality_reasons": qreasons, "risk_penalty": penalty,
-            "risk_reasons": preasons, "final_score": round(final, 2)}
+            p += 6; reasons.append("D/E > 1")
+    return p, reasons
 
 
-# ============================================================
-# PROCESS + SELECT
-# ============================================================
-def pre_process_records(records):
-    candidates = []
-    for record in records:
-        item = pre_boss_filter(record)
-        if not item:
-            continue
-        item["fundamentals"] = pre_get_fundamentals(item["symbol"])
-        item.update(pre_final_score(item))
-        candidates.append(item)
-    return candidates
+def score_item(it):
+    f = it["fundamentals"]
+    q = quality_score(f)
+    pen, reasons = risk_penalty(f, it["iep"])
+    final = it["buyer_score"] * 0.60 + min(100, q / 7 * 100) * 0.30 - pen * 0.10
+    it.update({"quality_score": q, "risk_reasons": reasons, "final_score": round(final, 2)})
 
 
-def pre_near_circuit(item):
-    band = pre_get_price_band(item["symbol"])
-    item["band"] = band
-    return bool(band) and item["change"] >= band * pre_CIRCUIT_BUFFER
+def near_circuit(it):
+    it["band"] = price_band(it["symbol"])
+    return bool(it["band"]) and it["change"] >= it["band"] * CIRCUIT_BUFFER
 
 
-def pre_is_penny(item):
-    price = item["fundamentals"]["price"] or item["iep"]
-    return bool(price) and price < pre_HARD_MIN_PRICE
+def is_penny(it):
+    price = it["fundamentals"]["price"] or it["iep"]
+    return bool(price) and price < HARD_MIN_PRICE
 
 
-def pre_select_gems(candidates):
-    """Min 1, Max MAX_GEMS. Circuit/penny hatate hain, par 0 kabhi nahi."""
-    if not candidates:
+def select_gems(cands):
+    """Min 1, Max 10. Circuit/penny hatate hain, par 0 kabhi nahi."""
+    if not cands:
         return []
-
-    candidates = sorted(
-        candidates,
-        key=lambda x: (x["final_score"], x["buyer_score"],
-                       x["quality_score"], x["ratio"]),
-        reverse=True,
-    )
-
-    # Circuit check sirf top 25 par (API calls bachane ke liye)
-    top = candidates[:25]
+    # Slow calls (yfinance + band) sirf top 25 buyer-score par
+    top = sorted(cands, key=lambda x: (x["buyer_score"], x["ratio"]), reverse=True)[:25]
     for c in top:
-        c["near_circuit"] = pre_near_circuit(c)
-        c["penny"] = pre_is_penny(c)
+        c["fundamentals"] = get_fundamentals(c["symbol"])
+        score_item(c)
+        c["near_circuit"] = near_circuit(c)
+        c["penny"] = is_penny(c)
+    top.sort(key=lambda x: (x["final_score"], x["buyer_score"], x["quality_score"], x["ratio"]),
+             reverse=True)
 
-    # Level 1: circuit nahi + penny nahi + score ok
     picks = [c for c in top if not c["near_circuit"] and not c["penny"]
-             and c["final_score"] >= pre_MIN_FINAL_SCORE]
-
-    # Level 2: score threshold hata do
-    if len(picks) < pre_MIN_GEMS:
+             and c["final_score"] >= MIN_FINAL_SCORE]
+    if len(picks) < MIN_GEMS:
         picks = [c for c in top if not c["near_circuit"] and not c["penny"]]
-
-    # Level 3: penny allow (circuit abhi bhi nahi)
-    if len(picks) < pre_MIN_GEMS:
+    if len(picks) < MIN_GEMS:
         picks = [c for c in top if not c["near_circuit"]]
-
-    # Level 4: last fallback - best candidate (warning ke saath)
-    if len(picks) < pre_MIN_GEMS:
+    if len(picks) < MIN_GEMS:
         picks = top[:1]
+    return picks[:MAX_GEMS]
 
-    return picks[:pre_MAX_GEMS]
 
-
-# ============================================================
-# FORMAT + SEND
-# ============================================================
-def pre_fmt_cr(v):
+def fmt_cr(v):
     return "N/A" if v is None else f"₹{v:,.0f} Cr"
 
 
-def pre_fmt_pct(v):
+def fmt_pct(v):
     return "N/A" if v is None else f"{v:.1f}%"
 
 
-def pre_fmt_qty(v):
-    return f"{int(v):,}"
-
-
-def pre_send_gem(item, rank):
-    f = item["fundamentals"]
-    risk_list = list(item["risk_reasons"])
-    if item.get("near_circuit"):
-        risk_list.append("⚠️ Circuit ke paas")
-    if item.get("penny"):
-        risk_list.append("⚠️ Penny price")
-    risk = ", ".join(risk_list) if risk_list else "Low Risk Penalty"
-
-    de_txt = f"{f['de']:.2f}" if f["de"] is not None else "N/A"
-    band_txt = f"{item['band']:.0f}%" if item.get("band") else "N/A"
-
-    message = f"""
+def send_gem(it, rank):
+    f = it["fundamentals"]
+    risk = list(it["risk_reasons"])
+    if it.get("near_circuit"):
+        risk.append("⚠️ Circuit ke paas")
+    if it.get("penny"):
+        risk.append("⚠️ Penny price")
+    risk_txt = ", ".join(risk) if risk else "Low Risk Penalty"
+    de = f"{f['de']:.2f}" if f["de"] is not None else "N/A"
+    band = f"{it['band']:.0f}%" if it.get("band") else "N/A"
+    tg(f"""
 💎 PREOPEN GEM #{rank}
 
-📌 {item['symbol']}  (₹{item['iep']:.2f})
+📌 {it['symbol']}  (₹{it['iep']:.2f})
 
 ━━━━━━━━━━━━━━━━━━
 👥 BUYER STRENGTH
 ━━━━━━━━━━━━━━━━━━
 
-📈 IEP Change : +{item['change']:.2f}%
-🚧 Price Band : {band_txt}
-⚖️ B/S Ratio  : {item['ratio']:.2f}x
-🟢 Buy Qty    : {pre_fmt_qty(item['buy_qty'])}
-🔴 Sell Qty   : {pre_fmt_qty(item['sell_qty'])}
+📈 IEP Change : +{it['change']:.2f}%
+🚧 Price Band : {band}
+⚖️ B/S Ratio  : {it['ratio']:.2f}x
+🟢 Buy Qty    : {int(it['buy_qty']):,}
+🔴 Sell Qty   : {int(it['sell_qty']):,}
 
-⭐ Buyer Score : {item['buyer_score']}/100
+⭐ Buyer Score : {it['buyer_score']}/100
 
 ━━━━━━━━━━━━━━━━━━
 🏦 FUNDAMENTALS
 ━━━━━━━━━━━━━━━━━━
 
-💰 Market Cap : {pre_fmt_cr(f['market_cap'])}
+💰 Market Cap : {fmt_cr(f['market_cap'])}
 
-ROE           : {pre_fmt_pct(f['roe'])}
-ROCE          : {pre_fmt_pct(f['roce'])}
-D/E           : {de_txt}
-Sales Growth  : {pre_fmt_pct(f['sales_growth'])}
-Profit Growth : {pre_fmt_pct(f['profit_growth'])}
-Pledge        : {pre_fmt_pct(f['pledge'])}
+ROE           : {fmt_pct(f['roe'])}
+ROCE          : {fmt_pct(f['roce'])}
+D/E           : {de}
+Sales Growth  : {fmt_pct(f['sales_growth'])}
+Profit Growth : {fmt_pct(f['profit_growth'])}
+Pledge        : {fmt_pct(f['pledge'])}
 
-⭐ Quality     : {item['quality_score']}/7
+⭐ Quality     : {it['quality_score']}/7
 
 ━━━━━━━━━━━━━━━━━━
 🛡️ RISK CHECK
 ━━━━━━━━━━━━━━━━━━
 
-{risk}
+{risk_txt}
 
-🏆 FINAL SCORE : {item['final_score']}/100
+🏆 FINAL SCORE : {it['final_score']}/100
 
 🔒 BOSS FILTER : PASSED
 👥 BUYER PRIORITY : HIGH
 
 💻 Made by Prakash Kanki
-"""
-    pre_telegram_send(message)
+""")
     time.sleep(0.5)
 
 
-def pre_send_summary(gems):
+def send_summary(gems):
     lines = [f"📋 PREOPEN GEMS SUMMARY ({len(gems)} stocks)\n"]
     for i, g in enumerate(gems, 1):
-        lines.append(f"{i}. {g['symbol']}  +{g['change']:.1f}%  "
-                     f"{g['ratio']:.1f}x  Score {g['final_score']}")
+        lines.append(f"{i}. {g['symbol']}  +{g['change']:.1f}%  {g['ratio']:.1f}x  "
+                     f"Score {g['final_score']}")
     lines.append("\n⚠️ Sirf screening hai, advice nahi. Stoploss zaroor rakhein.")
-    pre_telegram_send("\n".join(lines))
+    tg("\n".join(lines))
 
 
-def pre_startup_message():
-    pre_telegram_send(
-        "🔥 PREOPEN GEMS OFFICIAL\n\n"
-        "✅ Bot is online\n✅ Telegram connected\n✅ NSE scanner ready\n\n"
-        "🔒 BOSS FILTER LOCKED\n👥 Buyer Priority ACTIVE\n"
-        "🏦 Quality Ranking ACTIVE\n🛡️ Risk + Circuit + Penny Protection ACTIVE\n\n"
-        "⏰ Scan: 09:00–09:08 AM IST\n📨 Final list: 09:10 AM IST\n"
-        "📊 Output: 1–10 stocks\n\n💻 Made by Prakash Kanki"
-    )
+def run_preopen(state):
+    tg("📡 PRE-OPEN SCANNING STARTED\n⏰ 09:00–09:08 AM IST\n🔄 Every 30 seconds")
+    latest, got_data = [], False
 
+    # 09:00-09:08: sirf latest BOSS matches yaad rakho (cheap, spam nahi)
+    while hm() <= (9, 8):
+        recs = preopen_records()
+        log(f"NSE pre-open records: {len(recs)}")
+        if recs:
+            got_data = True
+            c = boss_matches(recs)
+            if c:
+                latest = c
+        time.sleep(SCAN_INTERVAL)
 
-# ============================================================
-# DAILY RUN
-# ============================================================
-def pre_wait_until(hour, minute):
-    while True:
-        now = datetime.now(pre_IST)
-        if (now.hour, now.minute) >= (hour, minute):
-            return
-        time.sleep(5)
+    # 09:10: final list
+    wait_until(9, 10)
+    recs = preopen_records()
+    if recs:
+        got_data = True
+    final = (boss_matches(recs) if recs else []) or latest
 
-
-def pre_run_today():
-    pre_wait_until(9, 0)
-    pre_telegram_send("📡 PRE-OPEN SCANNING STARTED\n⏰ 09:00–09:08 AM IST\n🔄 Every 30 seconds")
-
-    latest = []
-    got_any_data = False
-
-    # 09:00 - 09:08 : scan, sirf latest candidates yaad rakho (spam nahi)
-    while True:
-        now = datetime.now(pre_IST)
-        if (now.hour, now.minute) > (9, 8):
-            break
-        records = pre_get_nse_data()
-        print(f"{now:%H:%M:%S} NSE Records: {len(records)}")
-        if records:
-            got_any_data = True
-            candidates = pre_process_records(records)
-            print("BOSS Matches:", len(candidates))
-            if candidates:
-                latest = candidates
-        time.sleep(pre_SCAN_INTERVAL)
-
-    if not got_any_data:
-        pre_telegram_send("⚠️ NSE se pre-open data nahi mila (holiday ya NSE block ho sakta hai).")
+    if not got_data:
+        tg("⚠️ NSE se pre-open data nahi mila (holiday ya NSE ne block kiya).")
+        state["pre_done"] = str(now().date()); save_state(state)
         return
+    state["pre_done"] = str(now().date()); save_state(state)   # double-send se bachne ke liye
 
-    # 09:10 : final data lo aur list bhejo
-    pre_wait_until(FINAL_SEND_HOUR, FINAL_SEND_MIN)
-    records = pre_get_nse_data()
-    final_candidates = pre_process_records(records) if records else latest
-    if not final_candidates:
-        final_candidates = latest
-
-    gems = pre_select_gems(final_candidates)
-
-    if not gems:
-        pre_telegram_send("📭 Aaj BOSS filter (2%+, 3x buyers, 50k qty) me koi stock match nahi hua.")
+    if not final:
+        tg("📭 Aaj BOSS filter (2%+, 3x buyers, 50k qty) me koi stock match nahi hua.")
         return
-
+    gems = select_gems(final)
     for i, g in enumerate(gems, 1):
-        pre_send_gem(g, i)
-    pre_send_summary(gems)
+        send_gem(g, i)
+    send_summary(gems)
+    fund_cache.clear(); band_cache.clear()
 
 
-def pre_main():
-    pre_startup_message()
-    last_run_date = None
+# ============================================================
+# PART 2: INTRADAY SURGE (09:15 - 15:30)
+# ============================================================
+def fetch_universe():
+    rows = {}
+    for idx in INDEXES:
+        d = nse.get(INDEX_URL + quote(idx), tries=2)
+        for r in (d or {}).get("data", []):
+            sym = r.get("symbol") or ""
+            if sym and "NIFTY" not in sym.upper():
+                rows[sym] = r
+    return list(rows.values())
 
+
+def scan_once(rows, hist, alerted, sent):
+    warm = hm() < WARMUP_UNTIL
+    surges = []
+    for r in rows:
+        sym = r.get("symbol")
+        vol, px, chg = num(r.get("totalTradedVolume")), num(r.get("lastPrice")), num(r.get("pChange"))
+        if not sym or px <= 0:
+            continue
+        h = hist.setdefault(sym, {"vol": None, "px": None, "ints": []})
+        if h["vol"] is not None and vol >= h["vol"]:
+            iv = vol - h["vol"]
+            recent = h["ints"][-10:]
+            if not warm and sym not in alerted and len(recent) >= MIN_SAMPLES:
+                avg = sum(recent) / len(recent)
+                if (avg > 0 and iv >= VOL_RATIO * avg and iv * px >= MIN_INTERVAL_VALUE
+                        and chg >= PRICE_MIN_MOVE and px >= h["px"]):
+                    surges.append({"symbol": sym, "px": px, "chg": chg, "iv": iv, "vr": iv / avg})
+            h["ints"].append(iv)
+        h["vol"], h["px"] = vol, px
+
+    new = 0
+    surges.sort(key=lambda s: s["vr"], reverse=True)
+    for s in surges[:8]:
+        if sent + new >= MAX_ALERTS:
+            break
+        d = nse.get(QUOTE_URL + s["symbol"], tries=1) or {}
+        ob = d.get("marketDeptOrderBook", {}) if isinstance(d, dict) else {}
+        buy, sell = num(ob.get("totalBuyQuantity")), num(ob.get("totalSellQuantity"))
+        ratio = buy / sell if sell > 0 else 0
+        if ratio >= BUYER_MIN_RATIO:
+            new += 1
+            alerted.add(s["symbol"])
+            tg(f"""🚀 SURGE ALERT #{sent + new}
+
+📌 {s['symbol']}  (₹{s['px']:.2f})
+📈 Day Change : +{s['chg']:.2f}%
+🔊 Volume Surge : {s['vr']:.1f}x  ({int(s['iv']):,} shares in last {POLL_SEC // 60} min)
+🟢 Buy Qty  : {int(buy):,}
+🔴 Sell Qty : {int(sell):,}
+⚖️ Buy/Sell : {ratio:.2f}x
+
+⚠️ Sirf screening hai, advice nahi. Stoploss zaroor rakhein.
+💻 Made by Prakash Kanki""")
+        time.sleep(0.4)
+    return new
+
+
+def run_intraday(state):
+    hist, alerted, sent, fails = {}, set(), 0, 0
+    tg("📊 INTRADAY SURGE SCANNER ON\n⏰ 09:15–15:30 IST | har 3 min\n"
+       "🕘 Alerts 09:30 ke baad (pehle data collect)")
+    while hm() < MARKET_END:
+        t0 = time.time()
+        try:
+            rows = fetch_universe()
+            if not rows:
+                fails += 1
+                if fails >= 5 and not hist:
+                    log("Intraday data nahi (holiday/blocked) - aaj skip")
+                    break
+            else:
+                fails = 0
+                sent += scan_once(rows, hist, alerted, sent)
+        except Exception as e:
+            notify_error(e)
+        time.sleep(max(5, POLL_SEC - (time.time() - t0)))
+    state["intra_done"] = str(now().date()); save_state(state)
+    if hist:
+        tg(f"📴 Intraday scanner band. Aaj ke alerts: {sent}")
+
+
+# ============================================================
+# MAIN LOOP  (koi cron nahi - khud schedule karta hai)
+# ============================================================
+def main():
+    state = load_state()
+    log("Bot started")
     while True:
-        now = datetime.now(pre_IST)
-        today = now.date()
+        try:
+            n = now()
+            today = str(n.date())
 
-        # Weekday (Mon-Fri) aur aaj abhi tak run nahi hua
-        if now.weekday() < 5 and last_run_date != today and (now.hour, now.minute) <= (9, 8):
-            last_run_date = today
-            try:
-                pre_run_today()
-            except Exception as e:
-                pre_telegram_send(f"⚠️ Bot error: {e}")
-                print("Run error:", e)
-            pre_fundamental_cache.clear()
-            pre_band_cache.clear()
+            if state.get("hello") != today:
+                state["hello"] = today; save_state(state)
+                tg("🔥 PREOPEN GEMS + INTRADAY BOT ONLINE\n\n"
+                   "⏰ Pre-open: 09:00–09:08 scan, 09:10 final list\n"
+                   "📊 Intraday: 09:15–15:30 surge alerts (max 10)\n"
+                   "🗓 Mon–Fri auto | koi cron nahi\n\n💻 Made by Prakash Kanki")
 
-        time.sleep(30)
-
-
-
-
-# ============================================================
-# PART 2: INTRADAY SURGE (9:15-3:30)
-# ============================================================
-
-# ============================================================
-# INTRADAY MID+SMALLCAP VOLUME/BUYER SURGE SCANNER
-# Market hours: 09:15 - 15:30 IST
-# Universe: NIFTY MIDCAP 150 + NIFTY SMALLCAP 250
-# Alerts: sudden volume surge + sudden buyer surge, max 10/day
-# ============================================================
-
-intra_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-intra__raw_ids = os.getenv("TELEGRAM_CHAT_ID", "7418177111,1391074551")
-intra_TELEGRAM_CHAT_IDS = [x.strip() for x in intra__raw_ids.replace(";", ",").split(",") if x.strip()]
+            if n.weekday() < 5:
+                if state.get("pre_done") != today and (9, 0) <= hm() < (9, 14):
+                    run_preopen(state)
+                if state.get("intra_done")
