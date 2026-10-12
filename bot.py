@@ -31,6 +31,8 @@ import math
 import threading
 import requests
 import yfinance as yf
+import pyotp
+from SmartApi import SmartConnect
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -177,15 +179,15 @@ def start_keepalive_server():
 # ================================================================
 
 PO_BOSS_MIN_CHANGE = 2.0
-PO_BOSS_MIN_RATIO = 3.0
+PO_BOSS_MIN_RATIO = 2.0     # pehle 3.0 tha; loosen kiya taaki achhe stocks bhi pass karein
 PO_BOSS_MIN_BUY_QTY = 50000
 PO_BOSS_SERIES = "EQ"
 
-PO_MIN_GEMS = 1
+PO_MIN_GEMS = 0             # ab 0 allowed hai - kabhi penny/junk zabardasti nahi bhejenge
 PO_MAX_GEMS = 10
 PO_MIN_FINAL_SCORE = 35
 
-PO_HARD_MIN_PRICE = 50
+PO_HARD_MIN_PRICE = 20
 PO_CIRCUIT_BUFFER = 0.8
 
 PO_LOW_PRICE = 50
@@ -193,6 +195,13 @@ PO_VERY_LOW_PRICE = 20
 
 PO_NSE_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
 PO_NSE_QUOTE = "https://www.nseindia.com/api/quote-equity?symbol="
+
+# Quality floor: poore pre-open universe (jisme SME/illiquid/junk bhi aate
+# hain) ki jagah sirf NIFTY 500 ke stocks consider karte hain. Ye NSE ka
+# apna "top 500 by market cap + liquidity" list hai, isliye true penny ya
+# micro-cap stocks yahan khud hi exclude ho jate hain.
+PO_NIFTY500_CSV = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+po_nifty500_cache = set()
 
 po_session = make_nse_session()
 po_fundamental_cache = {}
@@ -484,11 +493,37 @@ def po_final_score(item):
     }
 
 
+def po_get_nifty500():
+    """Nifty500 symbol list - ek din me ek baar fetch/cache hoti hai."""
+    global po_nifty500_cache
+    if po_nifty500_cache:
+        return po_nifty500_cache
+    try:
+        resp = po_session.get(PO_NIFTY500_CSV, timeout=20)
+        if resp.status_code == 200:
+            reader = csv.DictReader(io.StringIO(resp.text))
+            po_nifty500_cache = set(
+                (row.get("Symbol") or "").strip() for row in reader if row.get("Symbol")
+            )
+            print("PO Nifty500 universe loaded: " + str(len(po_nifty500_cache)), flush=True)
+        else:
+            print("PO Nifty500 CSV HTTP: " + str(resp.status_code), flush=True)
+    except Exception as err:
+        print("PO Nifty500 CSV error: " + str(err), flush=True)
+    return po_nifty500_cache
+
+
 def po_process_records(records):
+    nifty500 = po_get_nifty500()
     candidates = []
     for record in records:
         item = po_boss_filter(record)
         if not item:
+            continue
+        # Nifty500 list mil gayi ho to sirf usi universe ke stocks consider
+        # karo (quality floor). List fetch fail ho jaye to filter skip karo,
+        # taaki ek NSE call fail hone se poora din 0 result na de.
+        if nifty500 and item["symbol"] not in nifty500:
             continue
         item["fundamentals"] = po_get_fundamentals(item["symbol"])
         item.update(po_final_score(item))
@@ -522,17 +557,14 @@ def po_select_gems(candidates):
         c["near_circuit"] = po_near_circuit(c)
         c["penny"] = po_is_penny(c)
 
-    picks = [c for c in top if not c["near_circuit"] and not c["penny"]
-             and c["final_score"] >= PO_MIN_FINAL_SCORE]
+    # Quality gate (not penny, not near circuit) HAMESHA lagta hai - isse
+    # kabhi compromise nahi karte, chahe result 0 hi kyun na aaye.
+    quality = [c for c in top if not c["near_circuit"] and not c["penny"]]
 
+    # Sirf score threshold relax hota hai agar strict score se kam milein.
+    picks = [c for c in quality if c["final_score"] >= PO_MIN_FINAL_SCORE]
     if len(picks) < PO_MIN_GEMS:
-        picks = [c for c in top if not c["near_circuit"] and not c["penny"]]
-
-    if len(picks) < PO_MIN_GEMS:
-        picks = [c for c in top if not c["near_circuit"]]
-
-    if len(picks) < PO_MIN_GEMS:
-        picks = top[:1]
+        picks = quality
 
     return picks[:PO_MAX_GEMS]
 
@@ -603,6 +635,9 @@ def po_send_summary(gems):
 
 
 def po_run_today():
+    global po_nifty500_cache
+    po_nifty500_cache = set()  # fresh Nifty500 list har din
+
     # 9:00 AM se pehle NSE ko bilkul call na karo (container kabhi bhi
     # restart ho, raat ko ya subah savere bhi) - warna NSE IP ko block
     # kar sakta hai, jisse baad me intraday bot bhi fail ho jata hai.
@@ -686,7 +721,7 @@ ID_PRICE_MIN_MOVE = 0.3
 ID_BUYER_MIN_RATIO = 1.5
 
 ID_MIN_PRICE = 50
-ID_CIRCUIT_BUFFER = 0.8
+ID_CIRCUIT_HEADROOM_PCT = 1.5  # upper circuit se 1.5% ke andar ho to "near circuit"
 ID_MAX_ALERTS_PER_DAY = 10
 ID_MIN_ALERT_SCORE = 40
 
@@ -695,39 +730,47 @@ ID_MIN_ROE = 0.0
 ID_MAX_DE = 2.5
 ID_MIN_MCAP_CR = 500
 
-# "equity-stockIndices" endpoint NSE ke bot-protection (Akamai) se 404 de
-# raha tha. Isliye universe yahan se banta hai:
-#   1) constituent symbols - static CSV se (archives server, kam protected)
-#   2) live price/volume/buy-sell - quote-equity se, per symbol
-#      (ye endpoint proven working hai - pre-open bot isi se mcap/band leta hai)
+# NSE seedha scrape karna (equity-stockIndices, quote-equity bulk) Akamai
+# bot-protection se block ho raha tha, chahe fingerprint/pacing kuch bhi ho.
+# Isliye live data ab Angel One SmartAPI (authorized, free) se aata hai:
+#   1) constituent symbols - static CSV se (ye NSE ka archive hai, kaam karta hai)
+#   2) live price/volume/buy-sell - Angel One getMarketData se, batched (50/call)
 ID_MIDCAP_CSV = "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv"
 ID_SMALLCAP_CSV = "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv"
 ID_NSE_QUOTE_URL = "https://www.nseindia.com/api/quote-equity?symbol={sym}"
-ID_NSE_QUOTE_FULL_URL = "https://www.nseindia.com/api/quote-equity?symbol={sym}&section=trade_info"
-ID_NSE_REFERER_PAGE = "https://www.nseindia.com/market-data/live-equity-market"
-ID_FETCH_DELAY_SEC = 0.5
-ID_CONSECUTIVE_FAIL_ABORT = 25
 
-id_session = make_nse_session(ID_NSE_REFERER_PAGE)
+ANGEL_SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "").strip()
+ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE", "").strip()
+ANGEL_PIN = os.getenv("ANGEL_PIN", "").strip()
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "").strip()
+ANGEL_BATCH_SIZE = 50
+
+id_session = requests.Session()
 id_fundamental_cache = {}
 id_history = {}
 id_alerted_today = set()
 id_alert_count_today = 0
 id_constituents_cache = []
 
+angel_client = None
+angel_token_map = {}
 
-def id_refresh_cookies():
-    try:
-        id_session.get("https://www.nseindia.com/", timeout=10)
-        id_session.get(ID_NSE_REFERER_PAGE, timeout=10)
-    except Exception:
-        pass
+id_debug_count = 0
+ID_DEBUG_LIMIT = 5  # sirf pehle 5 failures print karo, warna logs spam ho jayenge
+
+
+def id_debug_log(msg):
+    global id_debug_count
+    if id_debug_count < ID_DEBUG_LIMIT:
+        print("ID DEBUG: " + msg, flush=True)
+        id_debug_count += 1
 
 
 def id_fetch_csv_symbols(url):
     symbols = []
     try:
-        resp = id_session.get(url, timeout=20)
+        resp = id_session.get(url, headers=HTTP_HEADERS, timeout=20)
         if resp.status_code != 200:
             print("ID CSV HTTP " + url + ": " + str(resp.status_code), flush=True)
             return []
@@ -755,92 +798,117 @@ def id_get_constituents():
     return id_constituents_cache
 
 
-id_debug_count = 0
-ID_DEBUG_LIMIT = 5  # sirf pehle 5 failures print karo, warna logs spam ho jayenge
+def angel_login():
+    """Angel One SmartAPI session banata hai (TOTP ke saath). Din me ek baar."""
+    global angel_client
 
+    if not (ANGEL_API_KEY and ANGEL_CLIENT_CODE and ANGEL_PIN and ANGEL_TOTP_SECRET):
+        print("ANGEL credentials missing in env vars (API_KEY/CLIENT_CODE/PIN/TOTP_SECRET)", flush=True)
+        return False
 
-def id_debug_log(msg):
-    global id_debug_count
-    if id_debug_count < ID_DEBUG_LIMIT:
-        print("ID DEBUG: " + msg, flush=True)
-        id_debug_count += 1
-
-
-def id_fetch_symbol_quote(symbol):
-    """Ek symbol ka live price/volume/buy-sell/band - ek hi API call me."""
     try:
-        url = ID_NSE_QUOTE_FULL_URL.format(sym=symbol)
-        resp = id_session.get(url, timeout=10)
+        client = SmartConnect(api_key=ANGEL_API_KEY)
+        totp_now = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+        data = client.generateSession(ANGEL_CLIENT_CODE, ANGEL_PIN, totp_now)
 
-        if resp.status_code != 200:
-            id_debug_log(symbol + " HTTP " + str(resp.status_code) +
-                        " body: " + resp.text[:200])
-            return None
+        if not data or not data.get("status"):
+            print("ANGEL login failed: " + str(data), flush=True)
+            return False
 
-        data = resp.json()
-
-        price_info = data.get("priceInfo", {})
-        depth = data.get("marketDeptOrderBook", {})
-        trade_info = depth.get("tradeInfo", {})
-
-        price = safe_num(price_info.get("lastPrice"), None)
-        pchange = safe_num(price_info.get("pChange"), 0)
-        volume = safe_num(trade_info.get("totalTradedVolume"), None)
-        buy_qty = safe_num(depth.get("totalBuyQuantity"), 0)
-        sell_qty = safe_num(depth.get("totalSellQuantity"), 0)
-
-        band_raw = price_info.get("pPriceBand", "")
-        band = float(band_raw) if str(band_raw).replace(".", "").isdigit() else None
-
-        if price is None or volume is None:
-            id_debug_log(
-                symbol + " parsed but missing data. price=" + str(price)
-                + " volume=" + str(volume)
-                + " | top-level keys: " + str(list(data.keys()))
-                + " | priceInfo keys: " + str(list(price_info.keys()))
-                + " | depth keys: " + str(list(depth.keys()))
-            )
-            return None
-
-        return {
-            "symbol": symbol, "lastPrice": price, "pChange": pchange,
-            "totalTradedVolume": volume, "buy_qty": buy_qty,
-            "sell_qty": sell_qty, "band": band,
-        }
+        angel_client = client
+        print("ANGEL login successful", flush=True)
+        return True
     except Exception as err:
-        id_debug_log(symbol + " EXCEPTION: " + repr(err))
-        return None
+        print("ANGEL login exception: " + repr(err), flush=True)
+        return False
+
+
+def angel_load_token_map():
+    """Angel One ka symbol -> instrument-token mapping (ek baar/din)."""
+    global angel_token_map
+    if angel_token_map:
+        return angel_token_map
+
+    try:
+        resp = requests.get(ANGEL_SCRIP_MASTER_URL, timeout=30)
+        data = resp.json()
+        mapping = {}
+        for item in data:
+            if item.get("exch_seg") == "NSE" and str(item.get("symbol", "")).endswith("-EQ"):
+                sym = item["symbol"].replace("-EQ", "")
+                mapping[sym] = item.get("token")
+        angel_token_map = mapping
+        print("ANGEL token map loaded: " + str(len(mapping)), flush=True)
+    except Exception as err:
+        print("ANGEL token map error: " + repr(err), flush=True)
+
+    return angel_token_map
+
+
+def angel_fetch_batch(tokens, token_to_symbol):
+    """Angel One se ek batch (max 50) symbols ka live data."""
+    universe = {}
+    try:
+        resp = angel_client.getMarketData("FULL", {"NSE": tokens})
+        fetched = (resp or {}).get("data", {}).get("fetched", [])
+
+        for row in fetched:
+            tok = str(row.get("symbolToken", ""))
+            sym = token_to_symbol.get(tok)
+            if not sym:
+                continue
+
+            ltp = safe_num(row.get("ltp"), None)
+            pchange = safe_num(row.get("percentChange"), 0)
+            volume = safe_num(row.get("tradeVolume"), None)
+
+            depth = row.get("depth", {})
+            buy_qty = sum(safe_num(level.get("quantity"), 0) for level in depth.get("buy", []))
+            sell_qty = sum(safe_num(level.get("quantity"), 0) for level in depth.get("sell", []))
+            upper_circuit = safe_num(row.get("upperCircuit"), None)
+
+            if ltp is None or volume is None:
+                id_debug_log(sym + " angel parsed but missing: ltp=" + str(ltp) + " vol=" + str(volume))
+                continue
+
+            universe[sym] = {
+                "symbol": sym, "lastPrice": ltp, "pChange": pchange,
+                "totalTradedVolume": volume, "buy_qty": buy_qty,
+                "sell_qty": sell_qty, "upper_circuit": upper_circuit,
+            }
+    except Exception as err:
+        id_debug_log("ANGEL batch error: " + repr(err))
+
+    return universe
 
 
 def id_get_universe():
-    """Constituent list ke har symbol ka live quote EK-EK karke, thode gap
-    ke saath fetch karta hai. Parallel/burst requests NSE ko bot jaisa
-    dikhte hain aur turant 403 (Access Denied) de dete hain - isliye
-    yahan jaan-bujhkar slow, sequential pacing use ki hai."""
+    """Angel One SmartAPI se, 50-50 symbols ke batch me, poora universe
+    fetch karta hai - authorized API hai isliye NSE jaisi blocking nahi hoti."""
     symbols = id_get_constituents()
     if not symbols:
         return {}
 
-    universe = {}
-    consecutive_fail = 0
+    if angel_client is None:
+        if not angel_login():
+            return {}
 
+    token_map = angel_load_token_map()
+    if not token_map:
+        return {}
+
+    tokens, token_to_symbol = [], {}
     for sym in symbols:
-        result = id_fetch_symbol_quote(sym)
+        tok = token_map.get(sym)
+        if tok:
+            tokens.append(tok)
+            token_to_symbol[str(tok)] = sym
 
-        if result:
-            universe[result["symbol"]] = result
-            consecutive_fail = 0
-        else:
-            consecutive_fail += 1
-            if consecutive_fail >= ID_CONSECUTIVE_FAIL_ABORT:
-                print(
-                    "ID: " + str(consecutive_fail) + " consecutive fails - "
-                    "NSE abhi bhi block kar raha hai, cycle abort kar raha hoon",
-                    flush=True,
-                )
-                break
-
-        time.sleep(ID_FETCH_DELAY_SEC)
+    universe = {}
+    for i in range(0, len(tokens), ANGEL_BATCH_SIZE):
+        batch = tokens[i:i + ANGEL_BATCH_SIZE]
+        universe.update(angel_fetch_batch(batch, token_to_symbol))
+        time.sleep(0.4)  # Angel ke rate-limit ka chhota margin
 
     return universe
 
@@ -943,7 +1011,7 @@ def id_update_history_and_detect(universe, now):
                 "symbol": symbol, "price": price, "pchange": pchange,
                 "surge_ratio": surge_ratio, "cum_vol": cum_vol,
                 "buy_qty": d.get("buy_qty", 0), "sell_qty": d.get("sell_qty", 0),
-                "band": d.get("band"),
+                "upper_circuit": d.get("upper_circuit"),
             })
 
     return candidates
@@ -1011,13 +1079,14 @@ def id_past_warmup(now):
 
 def id_run_day():
     global id_alert_count_today, id_constituents_cache, id_debug_count
+    global angel_client, angel_token_map
     id_history.clear()
     id_alerted_today.clear()
     id_alert_count_today = 0
     id_constituents_cache = []  # fresh symbol list har din
     id_debug_count = 0
-
-    id_refresh_cookies()
+    angel_client = None  # fresh Angel One login har din
+    angel_token_map = {}
 
     telegram_send(
         "INTRADAY SCANNER STARTED\n"
@@ -1059,9 +1128,12 @@ def id_run_day():
                 if c["price"] < ID_MIN_PRICE:
                     continue
 
-                buy_qty, sell_qty, band = c["buy_qty"], c["sell_qty"], c["band"]
-                if band and c["pchange"] >= band * ID_CIRCUIT_BUFFER:
-                    continue
+                buy_qty, sell_qty = c["buy_qty"], c["sell_qty"]
+                upper_circuit = c.get("upper_circuit")
+                if upper_circuit and c["price"] > 0:
+                    headroom_pct = (upper_circuit - c["price"]) / c["price"] * 100
+                    if headroom_pct <= ID_CIRCUIT_HEADROOM_PCT:
+                        continue
                 if sell_qty <= 0 or (buy_qty / sell_qty) < ID_BUYER_MIN_RATIO:
                     continue
 
